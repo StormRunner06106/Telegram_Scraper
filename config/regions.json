@@ -1,0 +1,122 @@
+[
+  {
+    "id": 1,
+    "name": "Austin, TX",
+    "city": "Austin",
+    "state": "Texas"
+  },
+  {
+    "id": 2,
+    "name": "San Francisco, CA",
+    "city": "San Francisco",
+    "state": "California"
+  },
+  {
+    "id": 3,
+    "name": "New York, NY",
+    "city": "New York",
+    "state": "New York"
+  },
+  {
+    "id": 4,
+    "name": "Seattle, WA",
+    "city": "Seattle",
+    "state": "Washington"
+  },
+  {
+    "id": 5,
+    "name": "Boston, MA",
+    "city": "Boston",
+    "state": "Massachusetts"
+  },
+  {
+    "id": 6,
+    "name": "Los Angeles, CA",
+    "city": "Los Angeles",
+    "state": "California"
+  },
+  {
+    "id": 7,
+    "name": "Chicago, IL",
+    "city": "Chicago",
+    "state": "Illinois"
+  },
+  {
+    "id": 8,
+    "name": "Denver, CO",
+    "city": "Denver",
+    "state": "Colorado"
+  },
+  {
+    "id": 9,
+    "name": "Portland, OR",
+    "city": "Portland",
+    "state": "Oregon"
+  },
+  {
+    "id": 10,
+    "name": "Miami, FL",
+    "city": "Miami",
+    "state": "Florida"
+  },
+  {
+    "id": 11,
+    "name": "Atlanta, GA",
+    "city": "Atlanta",
+    "state": "Georgia"
+  },
+  {
+    "id": 12,
+    "name": "Dallas, TX",
+    "city": "Dallas",
+    "state": "Texas"
+  },
+  {
+    "id": 13,
+    "name": "San Diego, CA",
+    "city": "San Diego",
+    "state": "California"
+  },
+  {
+    "id": 14,
+    "name": "Phoenix, AZ",
+    "city": "Phoenix",
+    "state": "Arizona"
+  },
+  {
+    "id": 15,
+    "name": "Philadelphia, PA",
+    "city": "Philadelphia",
+    "state": "Pennsylvania"
+  },
+  {
+    "id": 16,
+    "name": "Washington, DC",
+    "city": "Washington",
+    "state": "District of Columbia"
+  },
+  {
+    "id": 17,
+    "name": "Raleigh, NC",
+    "city": "Raleigh",
+    "state": "North Carolina"
+  },
+  {
+    "id": 18,
+    "name": "Salt Lake City, UT",
+    "city": "Salt Lake City",
+    "state": "Utah"
+  },
+  {
+    "id": 19,
+    "name": "Minneapolis, MN",
+    "city": "Minneapolis",
+    "state": "Minnesota"
+  },
+  {
+    "id": 20,
+    "name": "Nashville, TN",
+    "city": "Nashville",
+    "state": "Tennessee"
+  }
+]

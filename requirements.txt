@@ -1,0 +1,2 @@
+# Optional dependencies for enhanced features
+supabase>=2.0.0  # For Supabase database sync
