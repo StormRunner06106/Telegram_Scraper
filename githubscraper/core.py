@@ -40,6 +40,15 @@ REGIONS_FILE = CONFIG_DIR / "regions.json"
 STATE_FILE = STATE_DIR / "state.json"
 SEARCH_START_YEAR = 2008
 SEARCH_MAX_PARTITIONS = 5000
+FOLLOWER_RANGES = [
+    "followers:>=1000",
+    "followers:500..999",
+    "followers:100..499",
+    "followers:50..99",
+    "followers:10..49",
+    "followers:1..9",
+    "followers:0",
+]
 
 NORMAL_BIG_COMPANIES = {
     "apple", "google", "microsoft", "amazon", "meta", "facebook", "netflix", "nvidia",
@@ -409,24 +418,13 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
     Returns:
         tuple: (list of users, has_more) where has_more indicates if more results might exist
     """
-    # Follower ranges to split the search
-    follower_ranges = [
-        "followers:>=1000",
-        "followers:500..999",
-        "followers:100..499",
-        "followers:50..99",
-        "followers:10..49",
-        "followers:1..9",
-        "followers:0",
-    ]
-    
     all_users: dict[str, dict[str, str]] = {}  # Use dict to deduplicate by username
     has_more = False
     initial_date_ranges = created_date_ranges()
     
     print("Fetching users from GitHub (walking last pages first and splitting crowded date ranges)...")
     
-    for follower_filter in follower_ranges:
+    for follower_filter in FOLLOWER_RANGES:
         pending_ranges = list(reversed(initial_date_ranges))
         partition_count = 0
 
@@ -444,18 +442,6 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
                 users, partition_has_more = search_github_users_single_query(location, combined_filter, token)
                 print(f"    Found {len(users)} users")
 
-                if partition_has_more:
-                    split_ranges = split_date_range(date_range)
-                    if split_ranges:
-                        print("    Partition is still capped by GitHub; splitting date range.")
-                        right, left = split_ranges[1], split_ranges[0]
-                        pending_ranges.insert(0, left)
-                        pending_ranges.insert(0, right)
-                        continue
-
-                    print("    Single-day partition is still capped by GitHub; some users may remain hidden.")
-                    has_more = True
-                
                 # Add to dict (deduplicates automatically)
                 for user in users:
                     username = user["username"]
@@ -467,6 +453,18 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
                     users_list = list(all_users.values())
                     users_list.reverse()
                     return users_list, has_more
+
+                if partition_has_more:
+                    split_ranges = split_date_range(date_range)
+                    if split_ranges:
+                        print("    Partition is still capped by GitHub; splitting date range.")
+                        right, left = split_ranges[1], split_ranges[0]
+                        pending_ranges.insert(0, left)
+                        pending_ranges.insert(0, right)
+                        continue
+
+                    print("    Single-day partition is still capped by GitHub; some users may remain hidden.")
+                    has_more = True
                 
                 # Small delay between queries to be nice to GitHub
                 time.sleep(0.5)
@@ -777,7 +775,7 @@ def scrape_region(
             f"but the requested limit is {max_results}. Reopening from the reversed fetched list."
         )
     
-    start_index = state_obj.index if resume and not state_obj.is_end else 0
+    start_index = state_obj.index if resume else 0
     total_processed = state_obj.total_processed if resume else 0
     
     if start_index > 0:
@@ -795,7 +793,11 @@ def scrape_region(
 
     print(f"Found {len(github_users)} GitHub users total.")
     if has_more:
-        print(f"Note: GitHub may have more users, but search is limited to {GITHUB_SEARCH_RESULT_LIMIT} results.")
+        print(
+            f"Note: GitHub may still have more users in this region. "
+            f"Collected {len(github_users)} unique users (GitHub caps each search query at "
+            f"{GITHUB_SEARCH_RESULT_LIMIT} results; the scraper works around that with partitions)."
+        )
     
     # Skip to start_index
     users_to_process = github_users[start_index:]

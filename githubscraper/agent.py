@@ -204,8 +204,9 @@ def input_limit() -> int | None:
     """Input data limit."""
     print("\n📊 Data Limit")
     print("-" * 60)
-    print("How many GitHub users should be fetched?")
-    print("(Default: 1000. Use a very large number to fetch as many as GitHub search can expose.)")
+    print("How many GitHub users should be checked (profile, badges, Telegram)?")
+    print("(Default: 1000. Use a very large number to process as many search results as possible.)")
+    print("Note: this is not how many contacts will be saved; most users are filtered out.")
     
     while True:
         try:
