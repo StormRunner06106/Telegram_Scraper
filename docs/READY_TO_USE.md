@@ -180,7 +180,7 @@ No manual intervention needed!
 
 For each GitHub user:
 
-1. ✅ Account age > 8 years
+1. ✅ Account age 6-20 years
 2. ✅ GitHub badges > 3
 3. ✅ Telegram account exists
 4. ✅ Company (if at major tech firm)

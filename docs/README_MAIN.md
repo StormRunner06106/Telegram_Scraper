@@ -29,7 +29,7 @@ python gscraper.py
 
 1. **Searches GitHub** users by location (20 US tech hubs)
 2. **Filters by**:
-   - Account age (>8 years)
+   - Account age (6-20 years)
    - GitHub badges (>3)
    - Telegram account exists
    - Company (optional: major tech firms)

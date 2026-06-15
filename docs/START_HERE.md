@@ -75,7 +75,7 @@ Follow the prompts:
 ```
 1. Scraper fetches GitHub users from selected region
 2. Filters by:
-   - Account age (>8 years)
+   - Account age (6-20 years)
    - GitHub badges (>3)
    - Telegram account exists
 3. Checks company (50+ major tech firms)

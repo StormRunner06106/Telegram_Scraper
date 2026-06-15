@@ -171,7 +171,7 @@ GitHub API
     ↓
 Filter by location
     ↓
-Check account age (>8 years)
+Check account age (6-20 years)
     ↓
 Check badges (>3)
     ↓
@@ -238,7 +238,7 @@ export SUPABASE_KEY="your_key"
 ## 🎯 Use Cases
 
 1. **Lead Generation** - Find developers with verified Telegram
-2. **Recruitment** - Identify experienced developers (8+ years)
+2. **Recruitment** - Identify experienced developers (6-20 years)
 3. **Market Research** - Analyze developer distribution
 4. **Community Building** - Find developers for communities
 5. **Data Analysis** - Study GitHub/Telegram correlations

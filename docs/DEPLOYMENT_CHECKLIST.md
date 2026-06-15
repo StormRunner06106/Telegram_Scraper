@@ -133,7 +133,7 @@ python setup_supabase.py
 
 - [ ] CSV has valid GitHub URLs
 - [ ] Telegram IDs start with @
-- [ ] Years are reasonable (>8)
+- [ ] Years are between 6 and 20
 - [ ] Company names are correct (if present)
 - [ ] Name match labels are correct
 

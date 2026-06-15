@@ -23,7 +23,8 @@ DEFAULT_COUNTRY = "United States"
 DEFAULT_MAX_RESULTS = 1000
 GITHUB_SEARCH_RESULT_LIMIT = 1000
 MIN_GITHUB_BADGES = 3
-MIN_GITHUB_YEARS = 8
+MIN_GITHUB_YEARS = 6
+MAX_GITHUB_YEARS = 20
 GITHUB_PROFILE_URL_TEMPLATE = "https://github.com/{username}"
 GITHUB_SEARCH_URL = "https://api.github.com/search/users"
 GITHUB_USER_URL_TEMPLATE = "https://api.github.com/users/{username}"
@@ -275,8 +276,17 @@ def github_account_age_years(created_at: str, now: datetime | None = None) -> in
     return years
 
 
+def account_age_is_within_required_year_range(account_age_years: int) -> bool:
+    return MIN_GITHUB_YEARS <= account_age_years <= MAX_GITHUB_YEARS
+
+
+def account_is_within_required_year_range(created_at: str) -> bool:
+    return account_age_is_within_required_year_range(github_account_age_years(created_at))
+
+
 def account_is_older_than_required_years(created_at: str) -> bool:
-    return github_account_age_years(created_at) > MIN_GITHUB_YEARS
+    """Backward-compatible alias for the current account-age range filter."""
+    return account_is_within_required_year_range(created_at)
 
 
 def parse_next_link(link_header: str | None) -> str | None:
@@ -380,18 +390,28 @@ def search_github_users_single_query(location: str, additional_filters: str, tok
     return users, hit_search_window
 
 
+def years_ago(current: datetime, years: int) -> date:
+    current_date = current.date()
+    try:
+        return current_date.replace(year=current_date.year - years)
+    except ValueError:
+        return current_date.replace(year=current_date.year - years, day=28)
+
+
 def created_date_ranges(now: datetime | None = None) -> list[DateRange]:
-    """Build yearly created-date partitions for accounts old enough to keep."""
+    """Build yearly created-date partitions for accounts in the target age range."""
     current = now or datetime.now(timezone.utc)
-    cutoff = date(current.year - MIN_GITHUB_YEARS, current.month, current.day)
+    oldest_allowed = years_ago(current, MAX_GITHUB_YEARS + 1) + timedelta(days=1)
+    newest_allowed = years_ago(current, MIN_GITHUB_YEARS)
+    search_start = max(date(SEARCH_START_YEAR, 1, 1), oldest_allowed)
+    if search_start > newest_allowed:
+        return []
+
     ranges: list[DateRange] = []
 
-    for year in range(SEARCH_START_YEAR, cutoff.year + 1):
-        start = date(year, 1, 1)
-        if year == cutoff.year:
-            end = cutoff
-        else:
-            end = date(year, 12, 31)
+    for year in range(search_start.year, newest_allowed.year + 1):
+        start = max(date(year, 1, 1), search_start)
+        end = min(date(year, 12, 31), newest_allowed)
         ranges.append(DateRange(start=start, end=end))
 
     return ranges
@@ -701,8 +721,11 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             continue
 
         account_age_years = github_account_age_years(created_at)
-        if not account_is_older_than_required_years(created_at):
-            print(f"Skipped account age <= {MIN_GITHUB_YEARS} years: {username} ({account_age_years} years)")
+        if not account_age_is_within_required_year_range(account_age_years):
+            print(
+                f"Skipped account age outside {MIN_GITHUB_YEARS}-{MAX_GITHUB_YEARS} years: "
+                f"{username} ({account_age_years} years)"
+            )
             continue
 
         try:
@@ -846,8 +869,11 @@ def scrape_region(
                 continue
 
             account_age_years = github_account_age_years(created_at)
-            if not account_is_older_than_required_years(created_at):
-                print(f"Skipped account age <= {MIN_GITHUB_YEARS} years: {username} ({account_age_years} years)")
+            if not account_age_is_within_required_year_range(account_age_years):
+                print(
+                    f"Skipped account age outside {MIN_GITHUB_YEARS}-{MAX_GITHUB_YEARS} years: "
+                    f"{username} ({account_age_years} years)"
+                )
                 current_index += 1
                 total_processed += 1
                 users_checked += 1

@@ -100,7 +100,7 @@ https://github.com/user,email@example.com,@user,blog.com,12,Google,matched
 
 ## 🎯 Filtering Criteria
 
-- ✅ Account age > 8 years
+- ✅ Account age 6-20 years
 - ✅ GitHub badges > 3
 - ✅ Telegram account exists
 - ✅ Company at major tech firm (optional)

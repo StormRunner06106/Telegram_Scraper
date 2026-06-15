@@ -87,7 +87,7 @@ python gscraper.py
 
 ### 1. Filtering Criteria
 
-- ✅ Account age > 8 years
+- ✅ Account age 6-20 years
 - ✅ GitHub badges > 3
 - ✅ Telegram account exists
 - ✅ Company at major tech firm (50+ companies)
@@ -247,7 +247,7 @@ Find developers at major tech companies with verified Telegram accounts.
 
 ### 2. Recruitment
 
-Identify experienced developers (8+ years) with active GitHub profiles.
+Identify experienced developers (6-20 years) with active GitHub profiles.
 
 ### 3. Market Research
 

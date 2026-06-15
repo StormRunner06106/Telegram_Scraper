@@ -105,7 +105,7 @@ python gscraper.py
 
 ### Filtering Criteria
 
-1. ✅ Account age > 8 years
+1. ✅ Account age 6-20 years
 2. ✅ GitHub badges > 3
 3. ✅ Telegram account exists
 4. ✅ Company at major tech firm (optional)
@@ -279,7 +279,7 @@ No manual intervention needed!
 ## 🎯 Use Cases
 
 1. **Lead Generation** - Find developers with verified Telegram
-2. **Recruitment** - Identify experienced developers (8+ years)
+2. **Recruitment** - Identify experienced developers (6-20 years)
 3. **Market Research** - Analyze developer distribution
 4. **Community Building** - Find developers for communities
 5. **Data Analysis** - Study GitHub/Telegram correlations
