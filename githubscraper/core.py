@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import re
 import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -35,6 +37,8 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = DATA_DIR / "output"
 STATE_DIR = DATA_DIR / "state"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE = LOG_DIR / "github_scraper.txt"
 DEFAULT_CONTACTS_FILE = OUTPUT_DIR / "contacts.csv"
 CSV_FIELDNAMES = ["link", "email", "telegramId", "blog", "years", "company", "nameMatch"]
 REGIONS_FILE = CONFIG_DIR / "regions.json"
@@ -60,6 +64,69 @@ NORMAL_BIG_COMPANIES = {
     "vmware", "dell", "hp", "samsung", "sony", "tencent", "alibaba", "baidu",
     "bytedance", "tiktok", "huawei", "xiaomi", "lenovo", "asus", "acer",
 }
+
+LOGGER = logging.getLogger("githubscraper")
+
+
+def setup_logging(log_path: Path | None = None) -> Path:
+    """Configure the shared rotating text logger once per process."""
+    path = log_path or LOG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path = path.resolve()
+
+    for handler in LOGGER.handlers:
+        if isinstance(handler, RotatingFileHandler) and Path(handler.baseFilename) == resolved_path:
+            return path
+
+    handler = RotatingFileHandler(
+        resolved_path,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(module)s.%(funcName)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+    LOGGER.info("Logger initialized path=%s", resolved_path)
+    return path
+
+
+def log_environment_status(source: str) -> None:
+    """Log configuration readiness without writing any secret values."""
+    LOGGER.info(
+        "Environment status source=%s github_token_loaded=%s supabase_url_loaded=%s supabase_key_loaded=%s",
+        source,
+        bool(os.getenv("GITHUB_TOKEN")),
+        bool(os.getenv("SUPABASE_URL")),
+        bool(os.getenv("SUPABASE_KEY")),
+    )
+
+
+def load_env_file(path: Path | None = None) -> bool:
+    """Load simple KEY=VALUE entries without overwriting exported variables."""
+    env_path = path or (PROJECT_ROOT / ".env")
+    if not env_path.exists():
+        LOGGER.warning("Environment file not found path=%s", env_path)
+        return False
+
+    with env_path.open("r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                os.environ.setdefault(key, value)
+    LOGGER.info("Environment file loaded path=%s", env_path.resolve())
+    return True
 
 
 @dataclass(frozen=True)
@@ -156,6 +223,13 @@ def update_region_state(region_id: int, index: int, is_end: bool, total_processe
         })
     
     save_state(states)
+    LOGGER.info(
+        "Region state saved region_id=%s index=%s total_processed=%s completed=%s",
+        region_id,
+        index,
+        total_processed,
+        is_end,
+    )
 
 
 def list_regions() -> None:
@@ -191,29 +265,96 @@ def list_regions() -> None:
 
 
 class GitHubRateLimitError(Exception):
-    def __init__(self, reset_at: int | None = None) -> None:
+    def __init__(
+        self,
+        reset_at: int | None = None,
+        retry_after: int | None = None,
+        resource: str | None = None,
+        secondary: bool = False,
+    ) -> None:
         self.reset_at = reset_at
+        self.retry_after = retry_after
+        self.resource = resource
+        self.secondary = secondary
         super().__init__(self.message)
 
     @property
     def message(self) -> str:
+        resource_text = f" for the {self.resource} resource" if self.resource else ""
         retry_text = ""
         if self.reset_at:
             retry_text = f" Retry after {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(self.reset_at))}."
-        return f"GitHub API rate limit exceeded.{retry_text} Use --github-token or GITHUB_TOKEN for higher limits."
+        elif self.retry_after:
+            retry_text = f" Retry after {self.retry_after} seconds."
+        limit_kind = "secondary rate limit" if self.secondary else "rate limit"
+        return f"GitHub API {limit_kind} exceeded{resource_text}.{retry_text}"
 
 
-def github_rate_limit_error(error: HTTPError) -> GitHubRateLimitError | None:
-    if error.code != 403:
+def github_rate_limit_error(error: HTTPError, response_body: str = "") -> GitHubRateLimitError | None:
+    """Convert GitHub primary and secondary rate responses into a retryable error."""
+    if error.code not in (403, 429):
         return None
 
     remaining = error.headers.get("X-RateLimit-Remaining")
-    if remaining != "0":
+    retry_header = error.headers.get("Retry-After")
+    response_message = response_body.lower()
+    secondary = "secondary rate limit" in response_message or "abuse detection" in response_message
+    is_rate_limit = error.code == 429 or remaining == "0" or retry_header is not None or secondary
+    if not is_rate_limit:
         return None
 
     reset_header = error.headers.get("X-RateLimit-Reset")
     reset_at = int(reset_header) if reset_header and reset_header.isdigit() else None
-    return GitHubRateLimitError(reset_at=reset_at)
+    retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
+    resource = error.headers.get("X-RateLimit-Resource")
+    return GitHubRateLimitError(
+        reset_at=reset_at,
+        retry_after=retry_after,
+        resource=resource,
+        secondary=secondary,
+    )
+
+
+_GITHUB_RATE_GATES: dict[str, int] = {}
+
+
+def github_resource_for_url(url: str) -> str | None:
+    if not url.startswith("https://api.github.com/"):
+        return None
+    if "/search/" in url:
+        return "search"
+    return "core"
+
+
+def github_rate_limit_wait_seconds(error: GitHubRateLimitError) -> int:
+    """Return a safe wait based on GitHub's response headers."""
+    if error.retry_after is not None:
+        return max(1, error.retry_after)
+    if error.reset_at is not None:
+        return max(1, int(error.reset_at - time.time()) + 2)
+    return 60
+
+
+def wait_for_github_rate_gate(resource: str | None) -> None:
+    if not resource:
+        return
+    reset_at = _GITHUB_RATE_GATES.get(resource)
+    if reset_at is None:
+        return
+    wait_seconds = max(0, int(reset_at - time.time()) + 2)
+    if wait_seconds > 0:
+        print(f"GitHub {resource} quota exhausted; waiting {wait_seconds} seconds for reset...")
+        LOGGER.warning("GitHub quota exhausted resource=%s wait_seconds=%s", resource, wait_seconds)
+        time.sleep(wait_seconds)
+    _GITHUB_RATE_GATES.pop(resource, None)
+
+
+def update_github_rate_gate(headers: dict[str, str]) -> None:
+    resource = headers.get("x-ratelimit-resource")
+    remaining = headers.get("x-ratelimit-remaining")
+    reset_header = headers.get("x-ratelimit-reset")
+    if resource and remaining == "0" and reset_header and reset_header.isdigit():
+        _GITHUB_RATE_GATES[resource] = int(reset_header)
 
 
 def normalize_location(location: str) -> str:
@@ -227,18 +368,35 @@ def normalize_location(location: str) -> str:
 
 
 def request_json_response(url: str, headers: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
-    print(url)
-    request = Request(url, headers=headers or {})
-    try:
-        with urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            response_headers = {key.lower(): value for key, value in response.headers.items()}
-            return data, response_headers
-    except HTTPError as error:
-        rate_limit_error = github_rate_limit_error(error)
-        if rate_limit_error:
-            raise rate_limit_error from error
-        raise
+    resource = github_resource_for_url(url)
+    while True:
+        wait_for_github_rate_gate(resource)
+        print(url)
+        LOGGER.debug("GitHub API request resource=%s url=%s", resource, url)
+        request = Request(url, headers=headers or {})
+        try:
+            with urlopen(request, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                response_headers = {key.lower(): value for key, value in response.headers.items()}
+                update_github_rate_gate(response_headers)
+                return data, response_headers
+        except HTTPError as error:
+            response_body = error.read().decode("utf-8", errors="ignore")
+            rate_limit_error = github_rate_limit_error(error, response_body)
+            if not rate_limit_error:
+                LOGGER.exception("GitHub API request failed resource=%s url=%s", resource, url)
+                raise
+
+            wait_seconds = github_rate_limit_wait_seconds(rate_limit_error)
+            print(f"{rate_limit_error} Waiting {wait_seconds} seconds, then retrying...", file=sys.stderr)
+            LOGGER.warning(
+                "GitHub rate limit encountered resource=%s status=%s wait_seconds=%s secondary=%s",
+                rate_limit_error.resource or resource,
+                error.code,
+                wait_seconds,
+                rate_limit_error.secondary,
+            )
+            time.sleep(wait_seconds)
 
 
 def request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
@@ -365,8 +523,23 @@ def search_github_users_single_query(location: str, additional_filters: str, tok
     total_count = int(first_data.get("total_count") or 0)
     page_count = min((total_count + per_page - 1) // per_page, GITHUB_SEARCH_RESULT_LIMIT // per_page)
     hit_search_window = total_count > GITHUB_SEARCH_RESULT_LIMIT
+    LOGGER.info(
+        "Search query metadata location=%s filters=%s total_count=%s accessible_pages=%s capped=%s",
+        location,
+        additional_filters,
+        total_count,
+        page_count,
+        hit_search_window,
+    )
 
     for page in range(page_count, 0, -1):
+        LOGGER.info(
+            "Search page focus location=%s filters=%s page=%s/%s",
+            location,
+            additional_filters,
+            page,
+            page_count,
+        )
         if page == 1:
             data = first_data
         else:
@@ -443,8 +616,9 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
     initial_date_ranges = created_date_ranges()
     
     print("Fetching users from GitHub (walking last pages first and splitting crowded date ranges)...")
+    LOGGER.info("Search started location=%s requested_users=%s", location, max_results)
     
-    for follower_filter in FOLLOWER_RANGES:
+    for follower_index, follower_filter in enumerate(FOLLOWER_RANGES):
         pending_ranges = list(reversed(initial_date_ranges))
         partition_count = 0
 
@@ -458,9 +632,24 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
 
             combined_filter = f"{follower_filter} {date_range.query}"
             print(f"  Searching with filter: {combined_filter}")
+            LOGGER.info(
+                "Search focus location=%s follower_filter=%s date_range=%s partition=%s pending=%s",
+                location,
+                follower_filter,
+                date_range.query,
+                partition_count,
+                len(pending_ranges),
+            )
             try:
                 users, partition_has_more = search_github_users_single_query(location, combined_filter, token)
                 print(f"    Found {len(users)} users")
+                LOGGER.info(
+                    "Search partition fetched location=%s filters=%s users=%s capped=%s",
+                    location,
+                    combined_filter,
+                    len(users),
+                    partition_has_more,
+                )
 
                 # Add to dict (deduplicates automatically)
                 for user in users:
@@ -470,8 +659,10 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
                 
                 if len(all_users) >= max_results:
                     print(f"Collected requested search limit of {max_results} unique users.")
-                    users_list = list(all_users.values())
-                    users_list.reverse()
+                    more_partitions = bool(pending_ranges) or follower_index < len(FOLLOWER_RANGES) - 1
+                    more_in_current_partition = len(all_users) > max_results
+                    has_more = has_more or partition_has_more or more_partitions or more_in_current_partition
+                    users_list = list(all_users.values())[:max_results]
                     return users_list, has_more
 
                 if partition_has_more:
@@ -488,27 +679,30 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
                 
                 # Small delay between queries to be nice to GitHub
                 time.sleep(0.5)
-                
+
             except GitHubRateLimitError:
-                print(f"    Rate limit hit, stopping search")
-                users_list = list(all_users.values())
-                return users_list, True
+                # request_json_response normally waits and retries internally.
+                # Preserve the error if a custom request layer raises it directly.
+                raise
             except Exception as e:
                 print(f"    Error with filter {combined_filter}: {e}")
+                LOGGER.exception("Search partition failed location=%s filters=%s", location, combined_filter)
                 continue
     
     users_list = list(all_users.values())
     print(f"Total unique users found: {len(users_list)}")
-    print("Processing order: last fetched GitHub results first.")
+    print("Processing order is stable across resumed batches.")
     
     return users_list, has_more
 
 
 def get_github_profile(username: str, token: str | None = None) -> dict[str, Any]:
-    return request_json(
+    profile = request_json(
         GITHUB_USER_URL_TEMPLATE.format(username=username),
         headers=github_headers(token),
     )
+    LOGGER.info("GitHub profile fetched username=%s", username)
+    return profile
 
 
 def normalize_name(name: str) -> str:
@@ -680,6 +874,13 @@ def build_contact(
 def scrape(location: str, output_path: Path, max_results: int, delay_seconds: float, token: str | None) -> int:
     normalized_location = normalize_location(location)
     print(f"Searching GitHub users in: {normalized_location}")
+    LOGGER.info(
+        "Custom scrape started location=%s max_results=%s output=%s authenticated=%s",
+        normalized_location,
+        max_results,
+        output_path,
+        bool(token),
+    )
 
     contacts = load_contacts(output_path)
     seen_links = {contact.link.lower() for contact in contacts}
@@ -701,6 +902,7 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             
         username = user["username"]
         github_url = user["github_url"]
+        LOGGER.info("Profile processing focus username=%s processed=%s/%s", username, processed, max_results)
         if github_url.lower() in seen_links:
             print(f"Skipping duplicate: {username}")
             continue
@@ -713,6 +915,7 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             break
         except (HTTPError, URLError, TimeoutError) as error:
             print(f"Could not fetch GitHub profile for {username}: {error}", file=sys.stderr)
+            LOGGER.exception("GitHub profile fetch failed username=%s", username)
             continue
 
         created_at = str(profile.get("created_at") or "")
@@ -732,6 +935,7 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             badge_count = count_github_badges(username)
         except (HTTPError, URLError, TimeoutError) as error:
             print(f"Could not check GitHub badges for {username}: {error}", file=sys.stderr)
+            LOGGER.exception("GitHub badge fetch failed username=%s", username)
             continue
 
         if badge_count <= MIN_GITHUB_BADGES:
@@ -742,6 +946,7 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             exists, telegram_full_name = telegram_account_exists(username)
         except (HTTPError, URLError, TimeoutError) as error:
             print(f"Could not check Telegram for {username}: {error}", file=sys.stderr)
+            LOGGER.exception("Telegram profile fetch failed username=%s", username)
             exists = False
             telegram_full_name = ""
 
@@ -754,8 +959,10 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             company_info = f", company: {contact.company}" if contact.company else ""
             name_info = f", name: {contact.nameMatch}"
             print(f"Upserted lead: {username} ({account_age_years} years, {badge_count} badges{company_info}{name_info})")
+            LOGGER.info("Lead saved username=%s output=%s", username, output_path)
         else:
             print(f"Skipped without Telegram match: {username}")
+            LOGGER.info("Profile rejected username=%s reason=no_telegram_match", username)
         
         processed += 1
 
@@ -763,6 +970,7 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
             time.sleep(delay_seconds)
 
     print(f"Upserted {added} leads to {output_path}")
+    LOGGER.info("Custom scrape finished location=%s processed=%s leads_added=%s", normalized_location, processed, added)
     return added
 
 
@@ -785,6 +993,15 @@ def scrape_region(
     location = f"{city}, {state}"
     
     print(f"Scraping region {region_id}: {region.get('name', location)}")
+    LOGGER.info(
+        "Region scrape started region_id=%s location=%s max_results=%s output=%s resume=%s authenticated=%s",
+        region_id,
+        location,
+        max_results,
+        output_path,
+        resume,
+        bool(token),
+    )
     
     # Load state
     state_obj = get_region_state(region_id)
@@ -808,8 +1025,23 @@ def scrape_region(
     contacts = load_contacts(output_path)
     seen_links = {contact.link.lower() for contact in contacts}
 
+    # A resumed batch must rebuild a stable prefix through the saved index and
+    # then collect the next requested batch. Searching for max_results alone
+    # would return the same prefix forever once start_index reached that size.
+    search_target = start_index + max_results
+    LOGGER.info(
+        "Region search target region_id=%s saved_index=%s batch_limit=%s search_target=%s",
+        region_id,
+        start_index,
+        max_results,
+        search_target,
+    )
     try:
-        github_users, has_more = search_github_users(normalized_location, max_results=max_results, token=token)
+        github_users, has_more = search_github_users(
+            normalized_location,
+            max_results=search_target,
+            token=token,
+        )
     except GitHubRateLimitError as error:
         print(error, file=sys.stderr)
         return 0
@@ -839,6 +1071,14 @@ def scrape_region(
                 
             username = user["username"]
             github_url = user["github_url"]
+            LOGGER.info(
+                "Profile processing focus region_id=%s username=%s index=%s batch_checked=%s/%s",
+                region_id,
+                username,
+                current_index,
+                users_checked,
+                max_results,
+            )
             
             if github_url.lower() in seen_links:
                 print(f"Skipping duplicate: {username}")
@@ -855,6 +1095,7 @@ def scrape_region(
                 break
             except (HTTPError, URLError, TimeoutError) as error:
                 print(f"Could not fetch GitHub profile for {username}: {error}", file=sys.stderr)
+                LOGGER.exception("GitHub profile fetch failed region_id=%s username=%s", region_id, username)
                 current_index += 1
                 total_processed += 1
                 users_checked += 1
@@ -883,6 +1124,7 @@ def scrape_region(
                 badge_count = count_github_badges(username)
             except (HTTPError, URLError, TimeoutError) as error:
                 print(f"Could not check GitHub badges for {username}: {error}", file=sys.stderr)
+                LOGGER.exception("GitHub badge fetch failed region_id=%s username=%s", region_id, username)
                 current_index += 1
                 total_processed += 1
                 users_checked += 1
@@ -899,6 +1141,7 @@ def scrape_region(
                 exists, telegram_full_name = telegram_account_exists(username)
             except (HTTPError, URLError, TimeoutError) as error:
                 print(f"Could not check Telegram for {username}: {error}", file=sys.stderr)
+                LOGGER.exception("Telegram profile fetch failed region_id=%s username=%s", region_id, username)
                 exists = False
                 telegram_full_name = ""
 
@@ -911,8 +1154,10 @@ def scrape_region(
                 company_info = f", company: {contact.company}" if contact.company else ""
                 name_info = f", name: {contact.nameMatch}"
                 print(f"Upserted lead: {username} ({account_age_years} years, {badge_count} badges{company_info}{name_info})")
+                LOGGER.info("Lead saved region_id=%s username=%s output=%s", region_id, username, output_path)
             else:
                 print(f"Skipped without Telegram match: {username}")
+                LOGGER.info("Profile rejected region_id=%s username=%s reason=no_telegram_match", region_id, username)
 
             current_index += 1
             total_processed += 1
@@ -942,7 +1187,8 @@ def scrape_region(
         elif reached_check_limit:
             print(f"Reached check limit of {max_results} users. Region not marked as complete.")
         else:
-            print(f"Progress saved. {len(github_users) - current_index} users remaining.")
+            visible_remaining = max(0, len(github_users) - current_index)
+            print(f"Progress saved. {visible_remaining} users currently available after the saved index.")
         
     except KeyboardInterrupt:
         print("\nInterrupted by user. Saving progress...")
@@ -951,6 +1197,13 @@ def scrape_region(
 
     print(f"Upserted {added} leads to {output_path}")
     print(f"Total processed: {total_processed} users")
+    LOGGER.info(
+        "Region scrape batch finished region_id=%s current_index=%s total_processed=%s leads_added=%s",
+        region_id,
+        current_index,
+        total_processed,
+        added,
+    )
     return added
 
 
@@ -1041,6 +1294,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    log_path = setup_logging()
+    env_loaded = load_env_file()
+    log_environment_status("github_scraper_cli")
+    LOGGER.info("CLI started env_file_loaded=%s arguments=%s", env_loaded, sys.argv[1:])
+    print(f"Log file: {log_path.resolve()}")
     args = parse_args()
     
     # Handle list command
@@ -1068,15 +1326,18 @@ def main() -> int:
             )
         except ValueError as error:
             print(error, file=sys.stderr)
+            LOGGER.exception("Invalid region command input")
             return 2
         except GitHubRateLimitError as error:
             print(error, file=sys.stderr)
             return 1
         except KeyboardInterrupt:
             print("\nStopped by user.", file=sys.stderr)
+            LOGGER.warning("Region command interrupted by user")
             return 130
         except (HTTPError, URLError, TimeoutError) as error:
             print(f"Request failed: {error}", file=sys.stderr)
+            LOGGER.exception("Region command request failed")
             return 1
         
         return 0
@@ -1111,12 +1372,14 @@ def main() -> int:
             )
         except ValueError as error:
             print(error, file=sys.stderr)
+            LOGGER.exception("Invalid custom scrape command input")
             return 2
         except GitHubRateLimitError as error:
             print(error, file=sys.stderr)
             return 1
         except (HTTPError, URLError, TimeoutError) as error:
             print(f"Request failed: {error}", file=sys.stderr)
+            LOGGER.exception("Custom scrape command request failed")
             return 1
 
         return 0

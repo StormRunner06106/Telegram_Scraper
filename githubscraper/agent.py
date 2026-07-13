@@ -30,10 +30,13 @@ load_env()
 # Import scraper functions
 from githubscraper.core import (
     DEFAULT_CONTACTS_FILE,
+    LOGGER,
     REGIONS_FILE,
     load_regions,
     get_region_by_id,
     get_region_state,
+    log_environment_status,
+    setup_logging,
     update_region_state,
     scrape_region,
 )
@@ -74,6 +77,7 @@ def get_supabase_client() -> Client | None:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as e:
         print(f"⚠️  Failed to connect to Supabase: {e}")
+        LOGGER.exception("Failed to connect to Supabase")
         return None
 
 
@@ -103,6 +107,7 @@ def sync_state_to_supabase(supabase: Client | None, region_id: int, index: int, 
         return True
     except Exception as e:
         print(f"⚠️  Failed to sync to Supabase: {e}")
+        LOGGER.exception("Failed to sync state to Supabase region_id=%s", region_id)
         return False
 
 
@@ -118,6 +123,7 @@ def load_state_from_supabase(supabase: Client | None, region_id: int) -> dict[st
         return None
     except Exception as e:
         print(f"⚠️  Failed to load from Supabase: {e}")
+        LOGGER.exception("Failed to load state from Supabase region_id=%s", region_id)
         return None
 
 
@@ -286,6 +292,7 @@ def rename_output_file(original_filename: str, region_id: int, start_index: int,
             print(f"✓ Renamed: {original_filename} → {new_filename}")
         except Exception as e:
             print(f"⚠️  Could not rename file: {e}")
+            LOGGER.exception("Could not rename output file source=%s target=%s", original_filename, new_filename)
             return original_filename
     
     return new_filename
@@ -315,6 +322,14 @@ def run_scraper_loop(
     print(f"Delay: {delay}s")
     print("=" * 60)
     print("\n💡 Press Ctrl+C to pause and save progress\n")
+    LOGGER.info(
+        "Agent loop started region_id=%s max_results=%s output=%s start_index=%s delay=%s",
+        region_id,
+        max_results,
+        output_filename,
+        start_index,
+        delay,
+    )
     
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
@@ -324,6 +339,7 @@ def run_scraper_loop(
     while not shutdown_requested:
         iteration += 1
         print(f"\n🔄 Iteration {iteration}")
+        LOGGER.info("Agent iteration started region_id=%s iteration=%s", region_id, iteration)
         
         # Check network
         if not check_network():
@@ -365,6 +381,7 @@ def run_scraper_loop(
         except Exception as e:
             print(f"\n❌ Error: {e}")
             print("⏳ Waiting 60 seconds before retry...")
+            LOGGER.exception("Agent iteration failed region_id=%s iteration=%s", region_id, iteration)
             time.sleep(60)
     
     # Handle shutdown
@@ -391,8 +408,13 @@ def run_scraper_loop(
 
 def main():
     """Main entry point."""
+    log_path = setup_logging()
+    LOGGER.info("Agent environment file status path=%s exists=%s", Path(".env").resolve(), Path(".env").exists())
+    log_environment_status("gscraper_agent")
+    LOGGER.info("Interactive agent started arguments=%s", sys.argv[1:])
     clear_screen()
     show_banner()
+    print(f"Log file: {log_path.resolve()}")
     
     # Initialize Supabase
     supabase = get_supabase_client()
@@ -433,6 +455,7 @@ def main():
         )
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
+        LOGGER.exception("Fatal interactive agent error")
         return 1
     
     print("\n👋 Goodbye!")

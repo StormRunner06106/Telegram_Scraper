@@ -40,3 +40,24 @@ def test_capped_partition_users_are_kept_before_splitting() -> None:
     assert any(username.startswith("quiet") for username in usernames)
     assert len(usernames) == 1050
     assert has_more is False
+
+
+def test_requested_limit_returns_stable_prefix_and_reports_more() -> None:
+    first_range = DateRange(start=date(2015, 1, 1), end=date(2015, 1, 1))
+    second_range = DateRange(start=date(2016, 1, 1), end=date(2016, 1, 1))
+
+    def fake_single_query(location: str, additional_filters: str, token=None):
+        if "created:2016-01-01" in additional_filters:
+            return _fake_users(4, "newer"), False
+        return _fake_users(4, "older"), False
+
+    with patch("githubscraper.core.FOLLOWER_RANGES", ["followers:0"]):
+        with patch("githubscraper.core.created_date_ranges", return_value=[first_range, second_range]):
+            with patch("githubscraper.core.search_github_users_single_query", side_effect=fake_single_query):
+                with patch("githubscraper.core.time.sleep"):
+                    first_batch, first_has_more = search_github_users("Austin, Texas", max_results=3)
+                    larger_batch, larger_has_more = search_github_users("Austin, Texas", max_results=6)
+
+    assert first_batch == larger_batch[:3]
+    assert first_has_more is True
+    assert larger_has_more is True
