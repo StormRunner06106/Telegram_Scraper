@@ -1,2 +1,5 @@
-# Optional dependencies for enhanced features
-supabase>=2.0.0  # For Supabase database sync
+# Ray Core runs one independent scraper process per selected location.
+ray>=2.40,<3
+
+# Test runner used by the documented verification command.
+pytest>=8,<10

@@ -5,6 +5,11 @@ import os
 import sys
 from pathlib import Path
 
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("manual environment and network smoke script", allow_module_level=True)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -35,7 +40,6 @@ def test_files_exist():
     required_files = [
         "github_scraper.py",
         "gscraper.py",
-        "setup_supabase.py",
         "config/regions.json",
         "requirements.txt",
     ]
@@ -104,13 +108,6 @@ def test_imports():
         print(f"   ❌ github_scraper module: {e}")
         return False
     
-    # Test supabase (optional)
-    try:
-        from supabase import create_client
-        print("   ✅ supabase (optional)")
-    except ImportError:
-        print("   ⚠️  supabase not installed (optional)")
-    
     return True
 
 
@@ -119,23 +116,10 @@ def test_environment():
     print("\n🔧 Testing environment variables...")
     
     github_token = os.getenv("GITHUB_TOKEN")
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_KEY")
-    
     if github_token:
         print(f"   ✅ GITHUB_TOKEN set ({len(github_token)} chars)")
     else:
         print("   ⚠️  GITHUB_TOKEN not set (recommended)")
-    
-    if supabase_url:
-        print(f"   ✅ SUPABASE_URL set")
-    else:
-        print("   ⚠️  SUPABASE_URL not set (optional)")
-    
-    if supabase_key:
-        print(f"   ✅ SUPABASE_KEY set ({len(supabase_key)} chars)")
-    else:
-        print("   ⚠️  SUPABASE_KEY not set (optional)")
     
     return True
 
@@ -229,7 +213,6 @@ def main():
     else:
         print("\n⚠️  Some tests failed. Please fix issues above.")
         print("\nCheck:")
-        print("  - SETUP_GUIDE.md for setup instructions")
         print("  - README.md for general documentation")
         return 1
 

@@ -61,3 +61,44 @@ def test_requested_limit_returns_stable_prefix_and_reports_more() -> None:
     assert first_batch == larger_batch[:3]
     assert first_has_more is True
     assert larger_has_more is True
+
+
+def test_unlimited_search_walks_every_partition() -> None:
+    first_range = DateRange(start=date(2015, 1, 1), end=date(2015, 1, 1))
+    second_range = DateRange(start=date(2016, 1, 1), end=date(2016, 1, 1))
+
+    def fake_single_query(location: str, additional_filters: str, token=None):
+        if "created:2016-01-01" in additional_filters:
+            return _fake_users(4, "newer"), False
+        return _fake_users(4, "older"), False
+
+    with patch("githubscraper.core.FOLLOWER_RANGES", ["followers:0"]):
+        with patch("githubscraper.core.created_date_ranges", return_value=[first_range, second_range]):
+            with patch("githubscraper.core.search_github_users_single_query", side_effect=fake_single_query):
+                with patch("githubscraper.core.time.sleep"):
+                    users, has_more = search_github_users("Canada", max_results=None)
+
+    assert len(users) == 8
+    assert {user["username"] for user in users} == {
+        "newer0", "newer1", "newer2", "newer3",
+        "older0", "older1", "older2", "older3",
+    }
+    assert has_more is False
+
+
+def test_partition_failure_is_not_silently_treated_as_exhaustion() -> None:
+    only_range = DateRange(start=date(2015, 1, 1), end=date(2015, 1, 1))
+
+    with patch("githubscraper.core.FOLLOWER_RANGES", ["followers:0"]):
+        with patch("githubscraper.core.created_date_ranges", return_value=[only_range]):
+            with patch(
+                "githubscraper.core.search_github_users_single_query",
+                side_effect=ConnectionError("network interrupted"),
+            ):
+                with patch("githubscraper.core.time.sleep"):
+                    try:
+                        search_github_users("Canada", max_results=None)
+                    except ConnectionError as error:
+                        assert str(error) == "network interrupted"
+                    else:
+                        raise AssertionError("partition failure was silently ignored")

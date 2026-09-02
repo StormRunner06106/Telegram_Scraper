@@ -3,6 +3,7 @@
 import io
 import json
 from email.message import Message
+from http.client import IncompleteRead
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -23,6 +24,17 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return self._body
+
+
+class FakeTextResponse(FakeResponse):
+    def __init__(self, body: str) -> None:
+        self._body = body.encode("utf-8")
+        self.headers = {}
+
+
+class BrokenReadResponse(FakeTextResponse):
+    def read(self) -> bytes:
+        raise IncompleteRead(b"", 100)
 
 
 def rate_error(
@@ -85,6 +97,57 @@ def test_secondary_403_retries_even_when_primary_quota_remains() -> None:
     mocked_sleep.assert_called_once_with(60)
 
 
+def test_json_request_retries_incomplete_response_body() -> None:
+    response = FakeResponse({"login": "octocat"})
+
+    with patch("githubscraper.core.urlopen", side_effect=[BrokenReadResponse(""), response]) as mocked_open:
+        with patch("githubscraper.core.time.sleep") as mocked_sleep:
+            data, _ = core.request_json_response("https://api.github.com/users/octocat")
+
+    assert data["login"] == "octocat"
+    assert mocked_open.call_count == 2
+    mocked_sleep.assert_called_once_with(2)
+
+
+def test_text_request_retries_incomplete_response_body() -> None:
+    response = FakeTextResponse("complete response")
+
+    with patch("githubscraper.core.urlopen", side_effect=[BrokenReadResponse(""), response]) as mocked_open:
+        with patch("githubscraper.core.time.sleep") as mocked_sleep:
+            body = core.request_text("https://github.com/octocat")
+
+    assert body == "complete response"
+    assert mocked_open.call_count == 2
+    mocked_sleep.assert_called_once_with(2)
+
+
+def test_interrupted_http_error_body_retries_original_request() -> None:
+    error = rate_error(429, '{"message":"rate limit exceeded"}', retry_after="7")
+    error.read = lambda: (_ for _ in ()).throw(IncompleteRead(b"", 50))
+    response = FakeResponse({"login": "octocat"})
+
+    with patch("githubscraper.core.urlopen", side_effect=[error, response]) as mocked_open:
+        with patch("githubscraper.core.time.sleep") as mocked_sleep:
+            data, _ = core.request_json_response("https://api.github.com/users/octocat")
+
+    assert data["login"] == "octocat"
+    assert mocked_open.call_count == 2
+    mocked_sleep.assert_called_once_with(2)
+
+
+def test_telegram_lookup_uses_retrying_text_request() -> None:
+    html = (
+        '<div class="tgme_page_title">Octo Cat</div>'
+        '<a class="tgme_username_link">You can contact @octocat right away</a>'
+    )
+    with patch("githubscraper.core.request_text", return_value=html) as mocked_request:
+        exists, full_name = core.telegram_account_exists("octocat")
+
+    assert exists is True
+    assert full_name == "Octo Cat"
+    mocked_request.assert_called_once()
+
+
 def test_search_and_profile_urls_use_independent_resources() -> None:
     assert core.github_resource_for_url("https://api.github.com/search/users?q=test") == "search"
     assert core.github_resource_for_url("https://api.github.com/users/octocat") == "core"
@@ -108,7 +171,7 @@ def test_text_logger_records_environment_readiness_without_secret_values(tmp_pat
         core.setup_logging(log_path)
         with patch.dict(
             core.os.environ,
-            {"GITHUB_TOKEN": "do-not-log-this-token", "SUPABASE_URL": "configured"},
+            {"GITHUB_TOKEN": "do-not-log-this-token"},
             clear=True,
         ):
             core.log_environment_status("test")
@@ -125,8 +188,6 @@ def test_text_logger_records_environment_readiness_without_secret_values(tmp_pat
                 handler.close()
 
     assert "github_token_loaded=True" in contents
-    assert "supabase_url_loaded=True" in contents
-    assert "supabase_key_loaded=False" in contents
     assert "GitHub profile fetched username=octocat" in contents
     assert "do-not-log-this-token" not in contents
 
@@ -156,3 +217,80 @@ def test_resumed_region_searches_through_saved_index_plus_next_batch(tmp_path: P
                         )
 
     assert observed_targets == [350]
+
+
+def test_unlimited_resumed_region_requests_all_search_results(tmp_path: Path) -> None:
+    observed_targets: list[int | None] = []
+
+    def fake_search(location: str, max_results: int | None, token=None):
+        observed_targets.append(max_results)
+        return [], True
+
+    state = core.RegionState(region_id=21, index=1000, is_end=False, total_processed=1000)
+    region = {"id": 21, "name": "Canada", "location": "Canada", "country": "Canada"}
+
+    with patch("githubscraper.core.get_region_by_id", return_value=region):
+        with patch("githubscraper.core.get_region_state", return_value=state):
+            with patch("githubscraper.core.load_contacts", return_value=[]):
+                with patch("githubscraper.core.search_github_users", side_effect=fake_search):
+                    with patch("githubscraper.core.update_region_state"):
+                        core.scrape_region(
+                            region_id=21,
+                            output_path=tmp_path / "contacts.csv",
+                            max_results=None,
+                            delay_seconds=0,
+                            token="token",
+                            resume=True,
+                        )
+
+    assert observed_targets == [None]
+
+
+def test_completed_region_is_not_reopened_for_unlimited_run(tmp_path: Path) -> None:
+    state = core.RegionState(region_id=21, index=5000, is_end=True, total_processed=5000)
+    region = {"id": 21, "name": "Canada", "location": "Canada", "country": "Canada"}
+
+    with patch("githubscraper.core.get_region_by_id", return_value=region):
+        with patch("githubscraper.core.get_region_state", return_value=state):
+            with patch("githubscraper.core.search_github_users") as mocked_search:
+                added = core.scrape_region(
+                    region_id=21,
+                    output_path=tmp_path / "contacts.csv",
+                    max_results=None,
+                    delay_seconds=0,
+                    token="token",
+                    resume=True,
+                )
+
+    assert added == 0
+    mocked_search.assert_not_called()
+
+
+def test_unlimited_region_checks_every_returned_candidate_and_completes(tmp_path: Path) -> None:
+    region = {"id": 21, "name": "Canada", "location": "Canada", "country": "Canada"}
+    state = core.RegionState(region_id=21, index=0, is_end=False, total_processed=0)
+    users = [
+        {"username": f"user{index}", "github_url": f"https://github.com/user{index}"}
+        for index in range(3)
+    ]
+    profile = {"created_at": "2015-01-01T00:00:00Z"}
+
+    with patch("githubscraper.core.get_region_by_id", return_value=region):
+        with patch("githubscraper.core.get_region_state", return_value=state):
+            with patch("githubscraper.core.load_contacts", return_value=[]):
+                with patch("githubscraper.core.search_github_users", return_value=(users, False)):
+                    with patch("githubscraper.core.get_github_profile", return_value=profile) as profiles:
+                        with patch("githubscraper.core.count_github_badges", return_value=4):
+                            with patch("githubscraper.core.telegram_account_exists", return_value=(False, "")):
+                                with patch("githubscraper.core.update_region_state") as update_state:
+                                    core.scrape_region(
+                                        region_id=21,
+                                        output_path=tmp_path / "contacts.csv",
+                                        max_results=None,
+                                        delay_seconds=0,
+                                        token="token",
+                                        resume=True,
+                                    )
+
+    assert profiles.call_count == 3
+    update_state.assert_called_with(21, 3, True, 3)

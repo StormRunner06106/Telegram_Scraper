@@ -1,67 +1,28 @@
 @echo off
-REM Installation script for GitHub Scraper (Windows)
+REM Installation script for GitHub Location Scraper (Windows)
 
 echo ==========================================
-echo   GitHub Scraper - Installation
+echo   GitHub Location Scraper - Installation
 echo ==========================================
-echo.
 
-REM Check Python version
-echo Checking Python version...
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo Error: Python not found. Please install Python 3.10+
-    pause
+    echo Error: Python 3.10 or newer is required.
     exit /b 1
 )
-python --version
-echo OK: Python found
-echo.
 
-REM Install dependencies
-echo Installing dependencies...
-set /p install_supabase="Install Supabase support? (Y/n): "
+echo Installing project dependencies...
+python -m pip install -r requirements.txt
+if errorlevel 1 exit /b 1
 
-if /i "%install_supabase%"=="n" (
-    echo Skipping Supabase installation
-) else (
-    pip install supabase
-    if errorlevel 1 (
-        echo Warning: Supabase installation failed (optional)
-    ) else (
-        echo OK: Supabase installed
-    )
-)
-echo.
-
-REM Create .env file
-echo Setting up environment...
 if not exist .env (
-    copy .env.example .env
-    echo OK: Created .env file
-    echo Warning: Please edit .env with your credentials
+    copy .env.example .env >nul
+    echo Created .env. Add your GitHub token before running the scraper.
 ) else (
-    echo Skipping: .env already exists
+    echo Existing .env retained.
 )
-echo.
 
-REM Run setup test
-echo Running setup test...
-python test_setup.py
-echo.
+python check_env.py
 
-echo ==========================================
-echo   Installation Complete!
-echo ==========================================
 echo.
-echo Next steps:
-echo   1. Edit .env with your credentials
-echo   2. Run: python setup_supabase.py (optional)
-echo   3. Run: python gscraper.py
-echo.
-echo Documentation:
-echo   - README_MAIN.md - Main documentation
-echo   - QUICK_REFERENCE.md - Quick commands
-echo   - SETUP_GUIDE.md - Detailed setup
-echo.
-pause
+echo Installation complete. See README.md, then run: python gscraper.py

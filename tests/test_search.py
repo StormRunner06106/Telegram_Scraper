@@ -3,6 +3,11 @@ import json
 import os
 import urllib.parse
 
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("live GitHub smoke script", allow_module_level=True)
+
 token = os.getenv("GITHUB_TOKEN")
 if not token:
     raise SystemExit("Set GITHUB_TOKEN to run this live GitHub API smoke test.")

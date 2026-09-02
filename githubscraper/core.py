@@ -11,10 +11,12 @@ import os
 import re
 import sys
 import time
+from http.client import HTTPException
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from ssl import SSLError
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -22,7 +24,6 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_COUNTRY = "United States"
-DEFAULT_MAX_RESULTS = 1000
 GITHUB_SEARCH_RESULT_LIMIT = 1000
 MIN_GITHUB_BADGES = 3
 MIN_GITHUB_YEARS = 6
@@ -37,6 +38,7 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = DATA_DIR / "output"
 STATE_DIR = DATA_DIR / "state"
+REGION_STATE_DIR = STATE_DIR / "regions"
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "github_scraper.txt"
 DEFAULT_CONTACTS_FILE = OUTPUT_DIR / "contacts.csv"
@@ -44,7 +46,8 @@ CSV_FIELDNAMES = ["link", "email", "telegramId", "blog", "years", "company", "na
 REGIONS_FILE = CONFIG_DIR / "regions.json"
 STATE_FILE = STATE_DIR / "state.json"
 SEARCH_START_YEAR = 2008
-SEARCH_MAX_PARTITIONS = 5000
+TRANSIENT_RETRY_MAX_SECONDS = 60
+TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 FOLLOWER_RANGES = [
     "followers:>=1000",
     "followers:500..999",
@@ -100,11 +103,9 @@ def setup_logging(log_path: Path | None = None) -> Path:
 def log_environment_status(source: str) -> None:
     """Log configuration readiness without writing any secret values."""
     LOGGER.info(
-        "Environment status source=%s github_token_loaded=%s supabase_url_loaded=%s supabase_key_loaded=%s",
+        "Environment status source=%s github_token_loaded=%s",
         source,
         bool(os.getenv("GITHUB_TOKEN")),
-        bool(os.getenv("SUPABASE_URL")),
-        bool(os.getenv("SUPABASE_KEY")),
     )
 
 
@@ -167,22 +168,49 @@ def get_region_by_id(region_id: int) -> dict[str, Any] | None:
     return None
 
 
+def get_region_location(region: dict[str, Any]) -> str:
+    """Return the GitHub location query configured for a region."""
+    configured_location = str(region.get("location") or "").strip()
+    if configured_location:
+        return configured_location
+
+    parts = [
+        str(region.get("city") or "").strip(),
+        str(region.get("state") or "").strip(),
+        str(region.get("country") or DEFAULT_COUNTRY).strip(),
+    ]
+    return ", ".join(part for part in parts if part)
+
+
 def load_state() -> list[dict[str, Any]]:
-    """Load scraper progress state."""
+    """Load all scraper progress, including legacy single-file state."""
+    states_by_region: dict[int, dict[str, Any]] = {}
     state_path = Path(STATE_FILE)
-    if not state_path.exists():
-        return []
-    
-    with state_path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    if state_path.exists():
+        with state_path.open("r", encoding="utf-8") as file:
+            for state in json.load(file):
+                states_by_region[int(state["region_id"])] = state
+
+    region_state_dir = Path(REGION_STATE_DIR)
+    if region_state_dir.exists():
+        for region_path in sorted(region_state_dir.glob("region_*.json")):
+            with region_path.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+            states_by_region[int(state["region_id"])] = state
+
+    return [states_by_region[region_id] for region_id in sorted(states_by_region)]
 
 
 def save_state(states: list[dict[str, Any]]) -> None:
-    """Save scraper progress state."""
-    state_path = Path(STATE_FILE)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    with state_path.open("w", encoding="utf-8") as file:
-        json.dump(states, file, indent=2)
+    """Save progress in independent files so Ray workers cannot clobber peers."""
+    for state in states:
+        region_id = int(state["region_id"])
+        state_path = Path(REGION_STATE_DIR) / f"region_{region_id}.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = state_path.with_suffix(f".{os.getpid()}.tmp")
+        with temporary_path.open("w", encoding="utf-8") as file:
+            json.dump(state, file, indent=2)
+        temporary_path.replace(state_path)
 
 
 def get_region_state(region_id: int) -> RegionState:
@@ -202,27 +230,14 @@ def get_region_state(region_id: int) -> RegionState:
 
 def update_region_state(region_id: int, index: int, is_end: bool, total_processed: int) -> None:
     """Update state for a specific region."""
-    states = load_state()
-    
-    # Find and update existing state or add new one
-    found = False
-    for state in states:
-        if state.get("region_id") == region_id:
-            state["index"] = index
-            state["is_end"] = is_end
-            state["total_processed"] = total_processed
-            found = True
-            break
-    
-    if not found:
-        states.append({
+    save_state([
+        {
             "region_id": region_id,
             "index": index,
             "is_end": is_end,
             "total_processed": total_processed,
-        })
-    
-    save_state(states)
+        }
+    ])
     LOGGER.info(
         "Region state saved region_id=%s index=%s total_processed=%s completed=%s",
         region_id,
@@ -240,13 +255,13 @@ def list_regions() -> None:
         return
     
     print("Available regions:")
-    print(f"{'ID':<5} {'Name':<30} {'State':<20}")
-    print("-" * 55)
+    print(f"{'ID':<5} {'Name':<38} {'Country':<20}")
+    print("-" * 65)
     for region in regions:
         region_id = region.get("id", "?")
         name = region.get("name", "Unknown")
-        state_name = region.get("state", "Unknown")
-        print(f"{region_id:<5} {name:<30} {state_name:<20}")
+        country = region.get("country", DEFAULT_COUNTRY)
+        print(f"{region_id:<5} {name:<38} {country:<20}")
     
     # Show state info
     print("\nRegion progress:")
@@ -358,17 +373,46 @@ def update_github_rate_gate(headers: dict[str, str]) -> None:
 
 
 def normalize_location(location: str) -> str:
-    """Normalize `city, state[, country]` and default missing country."""
+    """Normalize a country or `city, state[, country]` location."""
     parts = [part.strip() for part in location.split(",") if part.strip()]
-    if len(parts) < 2:
-        raise ValueError("Location must include at least city and state, like 'Austin, Texas'.")
+    if not parts:
+        raise ValueError("Location cannot be empty.")
     if len(parts) == 2:
         parts.append(DEFAULT_COUNTRY)
     return ", ".join(parts)
 
 
+def transient_retry_wait_seconds(failure_count: int) -> int:
+    """Return a capped exponential delay for an interrupted network response."""
+    return min(2 ** min(max(1, failure_count), 6), TRANSIENT_RETRY_MAX_SECONDS)
+
+
+def wait_for_transient_retry(
+    url: str,
+    error: Exception,
+    failure_count: int,
+    wait_seconds: int | None = None,
+) -> None:
+    """Wait before retrying the same request after a transient transport failure."""
+    effective_wait = wait_seconds or transient_retry_wait_seconds(failure_count)
+    print(
+        f"Transient network error while reading {url}: {error}. "
+        f"Retrying in {effective_wait} seconds...",
+        file=sys.stderr,
+    )
+    LOGGER.warning(
+        "Transient request failure url=%s error_type=%s failure_count=%s wait_seconds=%s",
+        url,
+        type(error).__name__,
+        failure_count,
+        effective_wait,
+    )
+    time.sleep(effective_wait)
+
+
 def request_json_response(url: str, headers: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
     resource = github_resource_for_url(url)
+    transient_failures = 0
     while True:
         wait_for_github_rate_gate(resource)
         print(url)
@@ -381,9 +425,18 @@ def request_json_response(url: str, headers: dict[str, str] | None = None) -> tu
                 update_github_rate_gate(response_headers)
                 return data, response_headers
         except HTTPError as error:
-            response_body = error.read().decode("utf-8", errors="ignore")
+            try:
+                response_body = error.read().decode("utf-8", errors="ignore")
+            except (HTTPException, URLError, TimeoutError, ConnectionError, SSLError) as read_error:
+                transient_failures += 1
+                wait_for_transient_retry(url, read_error, transient_failures)
+                continue
             rate_limit_error = github_rate_limit_error(error, response_body)
             if not rate_limit_error:
+                if error.code in TRANSIENT_HTTP_STATUSES:
+                    transient_failures += 1
+                    wait_for_transient_retry(url, error, transient_failures)
+                    continue
                 LOGGER.exception("GitHub API request failed resource=%s url=%s", resource, url)
                 raise
 
@@ -397,6 +450,9 @@ def request_json_response(url: str, headers: dict[str, str] | None = None) -> tu
                 rate_limit_error.secondary,
             )
             time.sleep(wait_seconds)
+        except (HTTPException, URLError, TimeoutError, ConnectionError, SSLError, json.JSONDecodeError) as error:
+            transient_failures += 1
+            wait_for_transient_retry(url, error, transient_failures)
 
 
 def request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
@@ -405,9 +461,23 @@ def request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, A
 
 
 def request_text(url: str, headers: dict[str, str] | None = None) -> str:
-    request = Request(url, headers=headers or {})
-    with urlopen(request, timeout=20) as response:
-        return response.read().decode("utf-8", errors="ignore")
+    transient_failures = 0
+    while True:
+        request = Request(url, headers=headers or {})
+        try:
+            with urlopen(request, timeout=20) as response:
+                return response.read().decode("utf-8", errors="ignore")
+        except HTTPError as error:
+            if error.code in TRANSIENT_HTTP_STATUSES:
+                transient_failures += 1
+                retry_header = error.headers.get("Retry-After")
+                retry_after = int(retry_header) if retry_header and retry_header.isdigit() else None
+                wait_for_transient_retry(url, error, transient_failures, retry_after)
+                continue
+            raise
+        except (HTTPException, URLError, TimeoutError, ConnectionError, SSLError) as error:
+            transient_failures += 1
+            wait_for_transient_retry(url, error, transient_failures)
 
 
 def github_headers(token: str | None = None) -> dict[str, str]:
@@ -602,11 +672,15 @@ def split_date_range(date_range: DateRange) -> tuple[DateRange, DateRange] | Non
     )
 
 
-def search_github_users(location: str, max_results: int, token: str | None = None) -> tuple[list[dict[str, str]], bool]:
-    """Search GitHub users by location using multiple queries to bypass 1000 limit.
+def search_github_users(
+    location: str,
+    max_results: int | None = None,
+    token: str | None = None,
+) -> tuple[list[dict[str, str]], bool]:
+    """Search public GitHub users by location with supported query partitions.
     
-    Uses follower count and created-date ranges to split searches and get more
-    than 1000 results where GitHub's Search API allows it.
+    Uses follower count and created-date ranges so each query stays within
+    GitHub Search's documented 1,000-result window.
     
     Returns:
         tuple: (list of users, has_more) where has_more indicates if more results might exist
@@ -616,7 +690,11 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
     initial_date_ranges = created_date_ranges()
     
     print("Fetching users from GitHub (walking last pages first and splitting crowded date ranges)...")
-    LOGGER.info("Search started location=%s requested_users=%s", location, max_results)
+    LOGGER.info(
+        "Search started location=%s requested_users=%s",
+        location,
+        max_results if max_results is not None else "all",
+    )
     
     for follower_index, follower_filter in enumerate(FOLLOWER_RANGES):
         pending_ranges = list(reversed(initial_date_ranges))
@@ -625,10 +703,6 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
         while pending_ranges:
             date_range = pending_ranges.pop(0)
             partition_count += 1
-            if partition_count > SEARCH_MAX_PARTITIONS:
-                print(f"  Reached partition safety limit for {follower_filter}; moving to next follower range.")
-                has_more = True
-                break
 
             combined_filter = f"{follower_filter} {date_range.query}"
             print(f"  Searching with filter: {combined_filter}")
@@ -657,7 +731,7 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
                     if username not in all_users:
                         all_users[username] = user
                 
-                if len(all_users) >= max_results:
+                if max_results is not None and len(all_users) >= max_results:
                     print(f"Collected requested search limit of {max_results} unique users.")
                     more_partitions = bool(pending_ranges) or follower_index < len(FOLLOWER_RANGES) - 1
                     more_in_current_partition = len(all_users) > max_results
@@ -687,7 +761,7 @@ def search_github_users(location: str, max_results: int, token: str | None = Non
             except Exception as e:
                 print(f"    Error with filter {combined_filter}: {e}")
                 LOGGER.exception("Search partition failed location=%s filters=%s", location, combined_filter)
-                continue
+                raise
     
     users_list = list(all_users.values())
     print(f"Total unique users found: {len(users_list)}")
@@ -750,45 +824,37 @@ def extract_telegram_full_name(username: str) -> str:
 
 def telegram_account_exists(username: str) -> tuple[bool, str]:
     """Check if Telegram account exists and return (exists, full_name)."""
-    request = Request(
-        TELEGRAM_URL_TEMPLATE.format(username=username),
-        headers={"User-Agent": USER_AGENT},
-    )
     try:
-        with urlopen(request, timeout=20) as response:
-            html = response.read().decode("utf-8", errors="ignore")
-            html_lower = html.lower()
-            normalized_username = username.lower()
-            contact_text = f"you can contact @{normalized_username} right away"
-            not_found_text = "username not found"
-
-            if response.status != 200 or not_found_text in html_lower:
-                return False, ""
-
-            exists = contact_text in html_lower or (
-                "tgme_page_title" in html_lower and "tgme_username_link" in html_lower
-            )
-            
-            if not exists:
-                return False, ""
-            
-            # Extract full name
-            match = re.search(r'<span[^>]*dir="auto"[^>]*>([^<]+)</span>', html)
-            if match:
-                full_name = match.group(1).strip()
-                return True, full_name
-            
-            # Fallback: look for tgme_page_title
-            match = re.search(r'<div[^>]*class="[^"]*tgme_page_title[^"]*"[^>]*>([^<]+)</div>', html)
-            if match:
-                full_name = match.group(1).strip()
-                return True, full_name
-            
-            return True, ""
+        html = request_text(
+            TELEGRAM_URL_TEMPLATE.format(username=username),
+            headers={"User-Agent": USER_AGENT},
+        )
     except HTTPError as error:
         if error.code == 404:
             return False, ""
         raise
+
+    html_lower = html.lower()
+    normalized_username = username.lower()
+    contact_text = f"you can contact @{normalized_username} right away"
+    if "username not found" in html_lower:
+        return False, ""
+
+    exists = contact_text in html_lower or (
+        "tgme_page_title" in html_lower and "tgme_username_link" in html_lower
+    )
+    if not exists:
+        return False, ""
+
+    match = re.search(r'<span[^>]*dir="auto"[^>]*>([^<]+)</span>', html)
+    if match:
+        return True, match.group(1).strip()
+
+    match = re.search(r'<div[^>]*class="[^"]*tgme_page_title[^"]*"[^>]*>([^<]+)</div>', html)
+    if match:
+        return True, match.group(1).strip()
+
+    return True, ""
 
 
 def load_contacts(path: Path) -> list[Contact]:
@@ -871,7 +937,13 @@ def build_contact(
     )
 
 
-def scrape(location: str, output_path: Path, max_results: int, delay_seconds: float, token: str | None) -> int:
+def scrape(
+    location: str,
+    output_path: Path,
+    max_results: int | None = None,
+    delay_seconds: float = 1.0,
+    token: str | None = None,
+) -> int:
     normalized_location = normalize_location(location)
     print(f"Searching GitHub users in: {normalized_location}")
     LOGGER.info(
@@ -897,12 +969,17 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
     processed = 0
     for user in github_users:
         # Stop if we've processed enough users to fill the CSV
-        if processed >= max_results:
+        if max_results is not None and processed >= max_results:
             break
             
         username = user["username"]
         github_url = user["github_url"]
-        LOGGER.info("Profile processing focus username=%s processed=%s/%s", username, processed, max_results)
+        LOGGER.info(
+            "Profile processing focus username=%s processed=%s/%s",
+            username,
+            processed,
+            max_results if max_results is not None else "all",
+        )
         if github_url.lower() in seen_links:
             print(f"Skipping duplicate: {username}")
             continue
@@ -977,9 +1054,9 @@ def scrape(location: str, output_path: Path, max_results: int, delay_seconds: fl
 def scrape_region(
     region_id: int,
     output_path: Path,
-    max_results: int,
-    delay_seconds: float,
-    token: str | None,
+    max_results: int | None = None,
+    delay_seconds: float = 1.0,
+    token: str | None = None,
     resume: bool = True,
 ) -> int:
     """Scrape a region by ID with resume capability."""
@@ -988,9 +1065,7 @@ def scrape_region(
         print(f"Region ID {region_id} not found in {REGIONS_FILE}", file=sys.stderr)
         return 0
     
-    city = region.get("city", "")
-    state = region.get("state", "")
-    location = f"{city}, {state}"
+    location = get_region_location(region)
     
     print(f"Scraping region {region_id}: {region.get('name', location)}")
     LOGGER.info(
@@ -1006,14 +1081,9 @@ def scrape_region(
     # Load state
     state_obj = get_region_state(region_id)
     
-    if state_obj.is_end and resume and max_results <= state_obj.index:
+    if state_obj.is_end and resume:
         print(f"Region {region_id} already completed. Use --no-resume to restart.")
         return 0
-    if state_obj.is_end and resume and max_results > state_obj.index:
-        print(
-            f"Region {region_id} was previously marked complete at index {state_obj.index}, "
-            f"but the requested limit is {max_results}. Reopening from the reversed fetched list."
-        )
     
     start_index = state_obj.index if resume else 0
     total_processed = state_obj.total_processed if resume else 0
@@ -1025,10 +1095,9 @@ def scrape_region(
     contacts = load_contacts(output_path)
     seen_links = {contact.link.lower() for contact in contacts}
 
-    # A resumed batch must rebuild a stable prefix through the saved index and
-    # then collect the next requested batch. Searching for max_results alone
-    # would return the same prefix forever once start_index reached that size.
-    search_target = start_index + max_results
+    # A capped resumed batch must rebuild a stable prefix through the saved
+    # index. Unlimited runs enumerate every supported search partition.
+    search_target = None if max_results is None else start_index + max_results
     LOGGER.info(
         "Region search target region_id=%s saved_index=%s batch_limit=%s search_target=%s",
         region_id,
@@ -1051,7 +1120,7 @@ def scrape_region(
         print(
             f"Note: GitHub may still have more users in this region. "
             f"Collected {len(github_users)} unique users (GitHub caps each search query at "
-            f"{GITHUB_SEARCH_RESULT_LIMIT} results; the scraper works around that with partitions)."
+            f"{GITHUB_SEARCH_RESULT_LIMIT} results; supported query partitions are used)."
         )
     
     # Skip to start_index
@@ -1065,7 +1134,7 @@ def scrape_region(
     try:
         for user in users_to_process:
             # Stop if we've checked enough users to meet the limit
-            if users_checked >= max_results:
+            if max_results is not None and users_checked >= max_results:
                 print(f"Reached limit of {max_results} users to check. Stopping.")
                 break
                 
@@ -1077,7 +1146,7 @@ def scrape_region(
                 username,
                 current_index,
                 users_checked,
-                max_results,
+                max_results if max_results is not None else "all",
             )
             
             if github_url.lower() in seen_links:
@@ -1170,11 +1239,10 @@ def scrape_region(
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
         
-        # Determine if we've truly exhausted all available users
-        # is_end should be True only if:
-        # 1. We've processed all users from GitHub's search results AND
-        # 2. GitHub has no more users (has_more is False) OR we hit the user check limit
-        reached_check_limit = users_checked >= max_results
+        # Completion requires processing every returned user and exhausting all
+        # supported search partitions. A user-supplied CLI cap never completes
+        # a region while more candidates remain.
+        reached_check_limit = max_results is not None and users_checked >= max_results
         processed_all_github_users = current_index >= len(github_users)
         
         # is_end is True only when we've exhausted GitHub's results (not just our limit)
@@ -1222,7 +1290,7 @@ def parse_args() -> argparse.Namespace:
     location_parser = subparsers.add_parser("scrape", help="Scrape by location string")
     location_parser.add_argument(
         "location",
-        help="Location as 'city, state[, country]'. Country defaults to United States.",
+        help="Country or 'city, state[, country]'. Two-part locations default to the United States.",
     )
     location_parser.add_argument(
         "-o",
@@ -1233,10 +1301,10 @@ def parse_args() -> argparse.Namespace:
     location_parser.add_argument(
         "--max-results",
         type=int,
-        default=DEFAULT_MAX_RESULTS,
+        default=None,
         help=(
-            f"Maximum GitHub users to check. Defaults to {DEFAULT_MAX_RESULTS}; "
-            f"GitHub Search exposes up to {GITHUB_SEARCH_RESULT_LIMIT} results per query."
+            "Optional candidate cap for a manual test run. By default every "
+            "candidate exposed by the supported search partitions is checked."
         ),
     )
     location_parser.add_argument(
@@ -1267,10 +1335,10 @@ def parse_args() -> argparse.Namespace:
     region_parser.add_argument(
         "--max-results",
         type=int,
-        default=DEFAULT_MAX_RESULTS,
+        default=None,
         help=(
-            f"Maximum GitHub users to check. Defaults to {DEFAULT_MAX_RESULTS}; "
-            f"GitHub Search exposes up to {GITHUB_SEARCH_RESULT_LIMIT} results per query."
+            "Optional candidate cap for a manual test run. By default every "
+            "candidate exposed by the supported search partitions is checked."
         ),
     )
     region_parser.add_argument(
@@ -1308,7 +1376,7 @@ def main() -> int:
     
     # Handle region command
     if args.command == "region":
-        if args.max_results < 1:
+        if args.max_results is not None and args.max_results < 1:
             print("--max-results must be greater than 0", file=sys.stderr)
             return 2
         if args.delay < 0:
@@ -1349,16 +1417,16 @@ def main() -> int:
             print("Run with --help for usage information.", file=sys.stderr)
             return 2
         
-        if args.max_results < 1:
+        if args.max_results is not None and args.max_results < 1:
             print("--max-results must be greater than 0", file=sys.stderr)
             return 2
         if args.delay < 0:
             print("--delay must be 0 or greater", file=sys.stderr)
             return 2
-        if not args.github_token and args.max_results > DEFAULT_MAX_RESULTS:
+        if not args.github_token:
             print(
                 "Warning: unauthenticated GitHub API calls are limited. "
-                "Use GITHUB_TOKEN or --github-token for larger runs.",
+                "Use GITHUB_TOKEN or --github-token for an exhaustive run.",
                 file=sys.stderr,
             )
 
