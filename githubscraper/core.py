@@ -11,12 +11,14 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from http.client import HTTPException
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from ssl import SSLError
+from threading import Lock, get_ident
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -28,6 +30,7 @@ GITHUB_SEARCH_RESULT_LIMIT = 1000
 MIN_GITHUB_BADGES = 3
 MIN_GITHUB_YEARS = 6
 MAX_GITHUB_YEARS = 20
+DEFAULT_VALIDATION_GATES = 5
 GITHUB_PROFILE_URL_TEMPLATE = "https://github.com/{username}"
 GITHUB_SEARCH_URL = "https://api.github.com/search/users"
 GITHUB_USER_URL_TEMPLATE = "https://api.github.com/users/{username}"
@@ -331,6 +334,25 @@ def github_rate_limit_error(error: HTTPError, response_body: str = "") -> GitHub
 
 
 _GITHUB_RATE_GATES: dict[str, int] = {}
+_GITHUB_RATE_GATES_LOCK = Lock()
+
+
+def _set_github_rate_gate(resource: str | None, reset_at: int | None) -> None:
+    """Publish the latest cooldown without letting one gate shorten another's."""
+    if not resource or reset_at is None:
+        return
+    with _GITHUB_RATE_GATES_LOCK:
+        current_reset = _GITHUB_RATE_GATES.get(resource, 0)
+        _GITHUB_RATE_GATES[resource] = max(current_reset, reset_at)
+
+
+def _clear_github_rate_gate(resource: str | None, observed_reset: int | None) -> None:
+    """Clear only the cooldown that this caller actually waited for."""
+    if not resource or observed_reset is None:
+        return
+    with _GITHUB_RATE_GATES_LOCK:
+        if _GITHUB_RATE_GATES.get(resource) == observed_reset:
+            _GITHUB_RATE_GATES.pop(resource, None)
 
 
 def github_resource_for_url(url: str) -> str | None:
@@ -353,15 +375,21 @@ def github_rate_limit_wait_seconds(error: GitHubRateLimitError) -> int:
 def wait_for_github_rate_gate(resource: str | None) -> None:
     if not resource:
         return
-    reset_at = _GITHUB_RATE_GATES.get(resource)
-    if reset_at is None:
-        return
-    wait_seconds = max(0, int(reset_at - time.time()) + 2)
-    if wait_seconds > 0:
-        print(f"GitHub {resource} quota exhausted; waiting {wait_seconds} seconds for reset...")
-        LOGGER.warning("GitHub quota exhausted resource=%s wait_seconds=%s", resource, wait_seconds)
-        time.sleep(wait_seconds)
-    _GITHUB_RATE_GATES.pop(resource, None)
+    while True:
+        with _GITHUB_RATE_GATES_LOCK:
+            reset_at = _GITHUB_RATE_GATES.get(resource)
+        if reset_at is None:
+            return
+        wait_seconds = max(0, int(reset_at - time.time()) + 2)
+        if wait_seconds > 0:
+            print(f"GitHub {resource} quota exhausted; waiting {wait_seconds} seconds for reset...")
+            LOGGER.warning("GitHub quota exhausted resource=%s wait_seconds=%s", resource, wait_seconds)
+            time.sleep(wait_seconds)
+        _clear_github_rate_gate(resource, reset_at)
+
+        with _GITHUB_RATE_GATES_LOCK:
+            if resource not in _GITHUB_RATE_GATES:
+                return
 
 
 def update_github_rate_gate(headers: dict[str, str]) -> None:
@@ -369,7 +397,7 @@ def update_github_rate_gate(headers: dict[str, str]) -> None:
     remaining = headers.get("x-ratelimit-remaining")
     reset_header = headers.get("x-ratelimit-reset")
     if resource and remaining == "0" and reset_header and reset_header.isdigit():
-        _GITHUB_RATE_GATES[resource] = int(reset_header)
+        _set_github_rate_gate(resource, int(reset_header))
 
 
 def normalize_location(location: str) -> str:
@@ -441,6 +469,13 @@ def request_json_response(url: str, headers: dict[str, str] | None = None) -> tu
                 raise
 
             wait_seconds = github_rate_limit_wait_seconds(rate_limit_error)
+            gate_resource = rate_limit_error.resource or resource
+            gate_reset_at = (
+                rate_limit_error.reset_at
+                if rate_limit_error.reset_at is not None
+                else int(time.time()) + wait_seconds
+            )
+            _set_github_rate_gate(gate_resource, gate_reset_at)
             print(f"{rate_limit_error} Waiting {wait_seconds} seconds, then retrying...", file=sys.stderr)
             LOGGER.warning(
                 "GitHub rate limit encountered resource=%s status=%s wait_seconds=%s secondary=%s",
@@ -450,6 +485,7 @@ def request_json_response(url: str, headers: dict[str, str] | None = None) -> tu
                 rate_limit_error.secondary,
             )
             time.sleep(wait_seconds)
+            _clear_github_rate_gate(gate_resource, gate_reset_at)
         except (HTTPException, URLError, TimeoutError, ConnectionError, SSLError, json.JSONDecodeError) as error:
             transient_failures += 1
             wait_for_transient_retry(url, error, transient_failures)
@@ -883,11 +919,13 @@ def load_contacts(path: Path) -> list[Contact]:
 
 def write_contacts(path: Path, contacts: list[Contact]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as file:
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.{get_ident()}.tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         for contact in contacts:
             writer.writerow(asdict(contact))
+    temporary_path.replace(path)
 
 
 def upsert_contact(path: Path, contacts: list[Contact], contact: Contact) -> list[Contact]:
@@ -934,6 +972,147 @@ def build_contact(
         years=account_age_years,
         company=company,
         nameMatch=name_match,
+    )
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """Immutable result returned by one parallel validation gate."""
+
+    index: int
+    gate_id: int | None
+    username: str
+    github_url: str
+    contact: Contact | None
+    message: str
+    error_message: str = ""
+
+
+def validate_user_in_gate(
+    index: int,
+    gate_id: int,
+    user: dict[str, str],
+    region_id: int,
+    delay_seconds: float,
+    token: str | None,
+) -> ValidationOutcome:
+    """Run the complete filter chain for one user without writing shared data."""
+    username = user["username"]
+    github_url = user["github_url"]
+    context = f"region_id={region_id} gate={gate_id} index={index} username={username}"
+    LOGGER.info("Validation gate started %s", context)
+
+    try:
+        profile = get_github_profile(username, token=token)
+    except GitHubRateLimitError:
+        raise
+    except (HTTPError, URLError, TimeoutError) as error:
+        LOGGER.exception("GitHub profile fetch failed %s", context)
+        return ValidationOutcome(
+            index=index,
+            gate_id=gate_id,
+            username=username,
+            github_url=github_url,
+            contact=None,
+            message="Skipped after GitHub profile request failed.",
+            error_message=f"Could not fetch GitHub profile for {username}: {error}",
+        )
+
+    created_at = str(profile.get("created_at") or "")
+    if not created_at:
+        return ValidationOutcome(
+            index=index,
+            gate_id=gate_id,
+            username=username,
+            github_url=github_url,
+            contact=None,
+            message=f"Skipped without GitHub created date: {username}",
+        )
+
+    account_age_years = github_account_age_years(created_at)
+    if not account_age_is_within_required_year_range(account_age_years):
+        return ValidationOutcome(
+            index=index,
+            gate_id=gate_id,
+            username=username,
+            github_url=github_url,
+            contact=None,
+            message=(
+                f"Skipped account age outside {MIN_GITHUB_YEARS}-{MAX_GITHUB_YEARS} years: "
+                f"{username} ({account_age_years} years)"
+            ),
+        )
+
+    try:
+        badge_count = count_github_badges(username)
+    except (HTTPError, URLError, TimeoutError) as error:
+        LOGGER.exception("GitHub badge fetch failed %s", context)
+        return ValidationOutcome(
+            index=index,
+            gate_id=gate_id,
+            username=username,
+            github_url=github_url,
+            contact=None,
+            message="Skipped after GitHub achievement request failed.",
+            error_message=f"Could not check GitHub badges for {username}: {error}",
+        )
+
+    if badge_count <= MIN_GITHUB_BADGES:
+        return ValidationOutcome(
+            index=index,
+            gate_id=gate_id,
+            username=username,
+            github_url=github_url,
+            contact=None,
+            message=(
+                f"Skipped badge count <= {MIN_GITHUB_BADGES}: "
+                f"{username} ({badge_count} badges)"
+            ),
+        )
+
+    telegram_error = ""
+    try:
+        exists, telegram_full_name = telegram_account_exists(username)
+    except (HTTPError, URLError, TimeoutError) as error:
+        LOGGER.exception("Telegram profile fetch failed %s", context)
+        exists = False
+        telegram_full_name = ""
+        telegram_error = f"Could not check Telegram for {username}: {error}"
+    finally:
+        # Each gate owns its own pacing delay, so five gates can wait in parallel.
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    if not exists:
+        LOGGER.info("Profile rejected %s reason=no_telegram_match", context)
+        return ValidationOutcome(
+            index=index,
+            gate_id=gate_id,
+            username=username,
+            github_url=github_url,
+            contact=None,
+            message=f"Skipped without Telegram match: {username}",
+            error_message=telegram_error,
+        )
+
+    contact = build_contact(
+        username,
+        account_age_years,
+        github_url,
+        profile,
+        telegram_full_name,
+    )
+    company_info = f", company: {contact.company}" if contact.company else ""
+    return ValidationOutcome(
+        index=index,
+        gate_id=gate_id,
+        username=username,
+        github_url=github_url,
+        contact=contact,
+        message=(
+            f"Qualified lead: {username} ({account_age_years} years, "
+            f"{badge_count} badges{company_info}, name: {contact.nameMatch})"
+        ),
     )
 
 
@@ -1058,8 +1237,12 @@ def scrape_region(
     delay_seconds: float = 1.0,
     token: str | None = None,
     resume: bool = True,
+    validation_gates: int = DEFAULT_VALIDATION_GATES,
 ) -> int:
     """Scrape a region by ID with resume capability."""
+    if validation_gates < 1:
+        raise ValueError("validation_gates must be at least 1.")
+
     region = get_region_by_id(region_id)
     if not region:
         print(f"Region ID {region_id} not found in {REGIONS_FILE}", file=sys.stderr)
@@ -1092,8 +1275,10 @@ def scrape_region(
         print(f"Resuming from index {start_index} (already processed {total_processed} users)")
     
     normalized_location = normalize_location(location)
-    contacts = load_contacts(output_path)
-    seen_links = {contact.link.lower() for contact in contacts}
+    contacts_by_link = {
+        contact.link.casefold(): contact for contact in load_contacts(output_path)
+    }
+    assigned_links = set(contacts_by_link)
 
     # A capped resumed batch must rebuild a stable prefix through the saved
     # index. Unlimited runs enumerate every supported search partition.
@@ -1123,154 +1308,206 @@ def scrape_region(
             f"{GITHUB_SEARCH_RESULT_LIMIT} results; supported query partitions are used)."
         )
     
-    # Skip to start_index
-    users_to_process = github_users[start_index:]
-    print(f"Processing {len(users_to_process)} users (skipping first {start_index})...")
+    available_count = max(0, len(github_users) - start_index)
+    print(
+        f"Processing {available_count} users (skipping first {start_index}) "
+        f"through {validation_gates} parallel validation gates..."
+    )
 
     added = 0
     current_index = start_index
-    users_checked = 0  # Track how many users we've actually checked (not skipped)
-    
-    try:
-        for user in users_to_process:
-            # Stop if we've checked enough users to meet the limit
-            if max_results is not None and users_checked >= max_results:
-                print(f"Reached limit of {max_results} users to check. Stopping.")
-                break
-                
-            username = user["username"]
-            github_url = user["github_url"]
-            LOGGER.info(
-                "Profile processing focus region_id=%s username=%s index=%s batch_checked=%s/%s",
-                region_id,
-                username,
-                current_index,
-                users_checked,
-                max_results if max_results is not None else "all",
+    next_dispatch_index = start_index
+    users_checked = 0
+    checks_assigned = 0
+    completed_outcomes: dict[int, ValidationOutcome] = {}
+    free_gate_ids = list(range(1, validation_gates + 1))
+    pending: dict[Future[ValidationOutcome], tuple[int, int]] = {}
+    stopped_for_rate_limit = False
+
+    def persist_finished_outcomes(outcomes: list[ValidationOutcome]) -> None:
+        """Persist gate results centrally before making them resumably complete."""
+        nonlocal added
+        new_contacts: list[ValidationOutcome] = []
+        for outcome in outcomes:
+            if outcome.contact is None:
+                continue
+            link_key = outcome.contact.link.casefold()
+            if link_key in contacts_by_link:
+                continue
+            contacts_by_link[link_key] = outcome.contact
+            new_contacts.append(outcome)
+
+        if new_contacts:
+            # Only this coordinator writes the region CSV. The atomic replace in
+            # write_contacts prevents a killed worker from leaving a partial file.
+            write_contacts(output_path, list(contacts_by_link.values()))
+            added += len(new_contacts)
+
+        new_contact_indexes = {outcome.index for outcome in new_contacts}
+        for outcome in sorted(outcomes, key=lambda item: item.index):
+            label = (
+                f"region {region_id}/g{outcome.gate_id}"
+                if outcome.gate_id is not None
+                else f"region {region_id}/coordinator"
             )
-            
-            if github_url.lower() in seen_links:
-                print(f"Skipping duplicate: {username}")
-                current_index += 1
-                total_processed += 1
-                continue
-
-            try:
-                profile = get_github_profile(username, token=token)
-            except GitHubRateLimitError as error:
-                print(error, file=sys.stderr)
-                print("Stopping early and saving progress.", file=sys.stderr)
-                update_region_state(region_id, current_index, False, total_processed)
-                break
-            except (HTTPError, URLError, TimeoutError) as error:
-                print(f"Could not fetch GitHub profile for {username}: {error}", file=sys.stderr)
-                LOGGER.exception("GitHub profile fetch failed region_id=%s username=%s", region_id, username)
-                current_index += 1
-                total_processed += 1
-                users_checked += 1
-                continue
-
-            created_at = str(profile.get("created_at") or "")
-            if not created_at:
-                print(f"Skipped without GitHub created date: {username}")
-                current_index += 1
-                total_processed += 1
-                users_checked += 1
-                continue
-
-            account_age_years = github_account_age_years(created_at)
-            if not account_age_is_within_required_year_range(account_age_years):
-                print(
-                    f"Skipped account age outside {MIN_GITHUB_YEARS}-{MAX_GITHUB_YEARS} years: "
-                    f"{username} ({account_age_years} years)"
+            if outcome.error_message:
+                print(f"[{label}] {outcome.error_message}", file=sys.stderr)
+            message = outcome.message
+            if outcome.index in new_contact_indexes:
+                message = message.replace("Qualified lead:", "Upserted lead:", 1)
+                LOGGER.info(
+                    "Lead saved region_id=%s gate=%s username=%s output=%s",
+                    region_id,
+                    outcome.gate_id,
+                    outcome.username,
+                    output_path,
                 )
-                current_index += 1
-                total_processed += 1
-                users_checked += 1
-                continue
+            print(f"[{label}] {message}")
 
-            try:
-                badge_count = count_github_badges(username)
-            except (HTTPError, URLError, TimeoutError) as error:
-                print(f"Could not check GitHub badges for {username}: {error}", file=sys.stderr)
-                LOGGER.exception("GitHub badge fetch failed region_id=%s username=%s", region_id, username)
-                current_index += 1
-                total_processed += 1
-                users_checked += 1
-                continue
-
-            if badge_count <= MIN_GITHUB_BADGES:
-                print(f"Skipped badge count <= {MIN_GITHUB_BADGES}: {username} ({badge_count} badges)")
-                current_index += 1
-                total_processed += 1
-                users_checked += 1
-                continue
-
-            try:
-                exists, telegram_full_name = telegram_account_exists(username)
-            except (HTTPError, URLError, TimeoutError) as error:
-                print(f"Could not check Telegram for {username}: {error}", file=sys.stderr)
-                LOGGER.exception("Telegram profile fetch failed region_id=%s username=%s", region_id, username)
-                exists = False
-                telegram_full_name = ""
-
-            if exists:
-                contact = build_contact(username, account_age_years, github_url, profile, telegram_full_name)
-                contacts = upsert_contact(output_path, contacts, contact)
-                seen_links.add(github_url.lower())
-                added += 1
-                
-                company_info = f", company: {contact.company}" if contact.company else ""
-                name_info = f", name: {contact.nameMatch}"
-                print(f"Upserted lead: {username} ({account_age_years} years, {badge_count} badges{company_info}{name_info})")
-                LOGGER.info("Lead saved region_id=%s username=%s output=%s", region_id, username, output_path)
-            else:
-                print(f"Skipped without Telegram match: {username}")
-                LOGGER.info("Profile rejected region_id=%s username=%s reason=no_telegram_match", region_id, username)
-
+    def advance_completed_frontier() -> None:
+        """Checkpoint only the contiguous prefix, never a later fast result."""
+        nonlocal current_index, total_processed, users_checked
+        advanced = False
+        while current_index in completed_outcomes:
+            outcome = completed_outcomes.pop(current_index)
             current_index += 1
             total_processed += 1
-            users_checked += 1
-            
-            # Save progress every 10 users
-            if total_processed % 10 == 0:
+            if outcome.gate_id is not None:
+                users_checked += 1
+            advanced = True
+        if advanced:
+            update_region_state(region_id, current_index, False, total_processed)
+
+    executor = ThreadPoolExecutor(
+        max_workers=validation_gates,
+        thread_name_prefix=f"region-{region_id}-gate",
+    )
+    try:
+        while True:
+            # Keep every available gate busy. Duplicate links become completed
+            # coordinator outcomes and are never submitted to a gate.
+            while (
+                free_gate_ids
+                and next_dispatch_index < len(github_users)
+                and (max_results is None or checks_assigned < max_results)
+            ):
+                candidate_index = next_dispatch_index
+                user = github_users[candidate_index]
+                next_dispatch_index += 1
+                username = user["username"]
+                github_url = user["github_url"]
+                link_key = github_url.casefold()
+
+                if link_key in assigned_links:
+                    completed_outcomes[candidate_index] = ValidationOutcome(
+                        index=candidate_index,
+                        gate_id=None,
+                        username=username,
+                        github_url=github_url,
+                        contact=None,
+                        message=f"Skipping duplicate: {username}",
+                    )
+                    continue
+
+                assigned_links.add(link_key)
+                gate_id = free_gate_ids.pop(0)
+                checks_assigned += 1
+                print(
+                    f"[region {region_id}/g{gate_id}] Checking {username} "
+                    f"(index {candidate_index})"
+                )
+                LOGGER.info(
+                    "Validation gate assignment region_id=%s gate=%s index=%s username=%s",
+                    region_id,
+                    gate_id,
+                    candidate_index,
+                    username,
+                )
+                future = executor.submit(
+                    validate_user_in_gate,
+                    candidate_index,
+                    gate_id,
+                    user,
+                    region_id,
+                    delay_seconds,
+                    token,
+                )
+                pending[future] = (candidate_index, gate_id)
+
+            advance_completed_frontier()
+
+            if not pending:
+                break
+
+            done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            finished: list[ValidationOutcome] = []
+            fatal_error: BaseException | None = None
+            for future in done:
+                candidate_index, gate_id = pending.pop(future)
+                free_gate_ids.append(gate_id)
+                free_gate_ids.sort()
+                try:
+                    finished.append(future.result())
+                except GitHubRateLimitError as error:
+                    fatal_error = error
+                except BaseException as error:
+                    fatal_error = error
+
+            if finished:
+                persist_finished_outcomes(finished)
+                for outcome in finished:
+                    completed_outcomes[outcome.index] = outcome
+                advance_completed_frontier()
+
+            if fatal_error is not None:
+                for future in pending:
+                    future.cancel()
                 update_region_state(region_id, current_index, False, total_processed)
-            
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
-        
-        # Completion requires processing every returned user and exhausting all
-        # supported search partitions. A user-supplied CLI cap never completes
-        # a region while more candidates remain.
-        reached_check_limit = max_results is not None and users_checked >= max_results
-        processed_all_github_users = current_index >= len(github_users)
-        
-        # is_end is True only when we've exhausted GitHub's results (not just our limit)
-        is_complete = processed_all_github_users and not has_more
-        
-        update_region_state(region_id, current_index, is_complete, total_processed)
-        
-        if is_complete:
-            print(f"Region {region_id} completed! All available GitHub users have been processed.")
-        elif reached_check_limit:
-            print(f"Reached check limit of {max_results} users. Region not marked as complete.")
-        else:
-            visible_remaining = max(0, len(github_users) - current_index)
-            print(f"Progress saved. {visible_remaining} users currently available after the saved index.")
-        
+                if isinstance(fatal_error, GitHubRateLimitError):
+                    print(fatal_error, file=sys.stderr)
+                    print("Stopping early and saving progress.", file=sys.stderr)
+                    stopped_for_rate_limit = True
+                    break
+                raise fatal_error
     except KeyboardInterrupt:
+        for future in pending:
+            future.cancel()
         print("\nInterrupted by user. Saving progress...")
         update_region_state(region_id, current_index, False, total_processed)
         raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    # Completion requires processing every returned user and exhausting all
+    # supported search partitions. A user-supplied CLI cap never completes a
+    # region while more candidates remain.
+    reached_check_limit = max_results is not None and checks_assigned >= max_results
+    processed_all_github_users = current_index >= len(github_users)
+
+    # is_end is True only when GitHub's exposed results are exhausted.
+    is_complete = processed_all_github_users and not has_more and not stopped_for_rate_limit
+
+    update_region_state(region_id, current_index, is_complete, total_processed)
+
+    if is_complete:
+        print(f"Region {region_id} completed! All available GitHub users have been processed.")
+    elif reached_check_limit:
+        print(f"Reached check limit of {max_results} users. Region not marked as complete.")
+    else:
+        visible_remaining = max(0, len(github_users) - current_index)
+        print(f"Progress saved. {visible_remaining} users currently available after the saved index.")
 
     print(f"Upserted {added} leads to {output_path}")
     print(f"Total processed: {total_processed} users")
     LOGGER.info(
-        "Region scrape batch finished region_id=%s current_index=%s total_processed=%s leads_added=%s",
+        "Region scrape batch finished region_id=%s current_index=%s total_processed=%s "
+        "checked_this_run=%s leads_added=%s validation_gates=%s",
         region_id,
         current_index,
         total_processed,
+        users_checked,
         added,
+        validation_gates,
     )
     return added
 

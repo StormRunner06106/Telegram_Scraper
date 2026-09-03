@@ -7,6 +7,7 @@ from githubscraper import core
 from githubscraper.agent import select_regions_for_processes
 from githubscraper.ray_runner import (
     WorkerResult,
+    _run_region_worker,
     merge_contact_files,
     merge_worker_outputs,
     region_output_path,
@@ -121,3 +122,26 @@ def test_cli_still_allows_an_explicit_test_cap() -> None:
         args = core.parse_args()
 
     assert args.max_results == 25
+
+
+def test_each_ray_region_worker_uses_five_validation_gates(tmp_path: Path) -> None:
+    output = tmp_path / "region.csv"
+    region = {"id": 21, "name": "Canada", "location": "Canada"}
+    state = core.RegionState(region_id=21, index=10, is_end=False, total_processed=10)
+
+    with patch("githubscraper.ray_runner.get_region_by_id", return_value=region):
+        with patch("githubscraper.ray_runner.load_contacts", return_value=[]):
+            with patch("githubscraper.ray_runner.get_region_state", return_value=state):
+                with patch("githubscraper.ray_runner.scrape_region", return_value=0) as scrape:
+                    result = _run_region_worker(21, str(output), None, 1.0, "token")
+
+    assert not result["error"]
+    scrape.assert_called_once_with(
+        region_id=21,
+        output_path=output,
+        max_results=None,
+        delay_seconds=1.0,
+        token="token",
+        resume=True,
+        validation_gates=core.DEFAULT_VALIDATION_GATES,
+    )

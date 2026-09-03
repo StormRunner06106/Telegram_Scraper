@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 from githubscraper.core import (
     DEFAULT_CONTACTS_FILE,
+    DEFAULT_VALIDATION_GATES,
     LOGGER,
     load_env_file,
     load_regions,
@@ -132,6 +133,7 @@ def main() -> int:
 
         print("\nStarting Ray workers...")
         print("Candidate limit: none (processing until search partitions are exhausted)")
+        print(f"Validation gates per Ray worker: {DEFAULT_VALIDATION_GATES}")
         print(f"Combined output: {DEFAULT_CONTACTS_FILE}")
         if not token:
             print("Warning: GITHUB_TOKEN is not set; GitHub permits much lower API quotas.")

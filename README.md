@@ -41,9 +41,17 @@ On startup the runner:
 2. Shows the full location list for process 1.
 3. Removes that selection before showing the list for process 2, and repeats.
 4. Starts one Ray worker per selected location.
-5. Writes an independent CSV and resume-state file per worker.
-6. Merges every worker CSV, including partial output from an interrupted worker,
+5. Runs five concurrent validation gates inside every Ray worker. Each gate
+   checks a different user through the profile-age, achievement, and Telegram
+   filters.
+6. Writes an independent CSV and resume-state file per worker.
+7. Merges every worker CSV, including partial output from an interrupted worker,
    into `data/output/contacts.csv`.
+
+Gate threads never write CSV files directly. Their region coordinator assigns
+each GitHub link once, serializes and atomically replaces the region CSV, and
+only checkpoints a contiguous completed prefix. This prevents duplicate rows
+and prevents a fast gate from advancing resume state past an unfinished user.
 
 Canada and the United Kingdom can be selected country-wide. Toronto, Vancouver,
 Montreal, Ottawa, Calgary, London, Manchester, Edinburgh, Bristol, and Cambridge
@@ -56,6 +64,10 @@ Configure the delay between profile checks in `.env` when needed:
 ```env
 SCRAPE_DELAY_SECONDS=1.0
 ```
+
+The delay is applied independently by each gate after its Telegram check, so
+one region can have up to five validation requests in flight. With multiple
+selected regions, total validation concurrency is `region count × 5`.
 
 Progress is resumable, so another run continues each selected region from its
 saved index.

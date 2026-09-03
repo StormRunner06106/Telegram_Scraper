@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from githubscraper.core import (
+    DEFAULT_VALIDATION_GATES,
     DEFAULT_CONTACTS_FILE,
     OUTPUT_DIR,
     get_region_by_id,
@@ -62,6 +63,7 @@ def _run_region_worker(
     max_results: int | None,
     delay_seconds: float,
     token: str | None,
+    validation_gates: int = DEFAULT_VALIDATION_GATES,
 ) -> dict[str, Any]:
     """Execute one region inside a Ray worker process."""
     region = get_region_by_id(region_id)
@@ -75,6 +77,7 @@ def _run_region_worker(
             delay_seconds=delay_seconds,
             token=token,
             resume=True,
+            validation_gates=validation_gates,
         )
         state = get_region_state(region_id)
         result = WorkerResult(
@@ -105,8 +108,9 @@ def run_parallel_scrape(
     delay_seconds: float = 1.0,
     token: str | None = None,
     destination: Path = DEFAULT_CONTACTS_FILE,
+    validation_gates: int = DEFAULT_VALIDATION_GATES,
 ) -> tuple[list[WorkerResult], int]:
-    """Run one Ray process per unique region and merge all saved outputs."""
+    """Run one Ray process per region, each with parallel validation gates."""
     if not region_ids:
         raise ValueError("Select at least one region.")
     if len(region_ids) != len(set(region_ids)):
@@ -115,6 +119,8 @@ def run_parallel_scrape(
         raise ValueError("max_results must be at least 1.")
     if delay_seconds < 0:
         raise ValueError("delay_seconds cannot be negative.")
+    if validation_gates < 1:
+        raise ValueError("validation_gates must be at least 1.")
 
     regions = [get_region_by_id(region_id) for region_id in region_ids]
     if any(region is None for region in regions):
@@ -145,6 +151,7 @@ def run_parallel_scrape(
                 max_results,
                 delay_seconds,
                 token,
+                validation_gates,
             )
         )
 
