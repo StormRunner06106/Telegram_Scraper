@@ -8,6 +8,8 @@ __pycache__/
 venv/
 .env
 data/output/
+new_output/
+data/backups/
 data/state/
 data/logs/
 *.csv

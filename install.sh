@@ -15,7 +15,7 @@ else
     echo "Existing .env retained."
 fi
 
-chmod +x gscraper.sh install.sh
+chmod +x gscraper gscraper.sh install.sh
 python3 check_env.py
 
 echo "Installation complete. See README.md, then run: python3 gscraper.py"

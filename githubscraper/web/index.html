@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GScraper · CSV browser</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">g.</span> GScraper <span class="brand-divider">/</span> <span class="muted">CSV browser</span></div>
+    <span class="local-badge"><span></span> Local workspace</span>
+  </header>
+  <div class="workspace">
+    <aside id="sidebar" aria-label="CSV files">
+      <div class="sidebar-heading"><span>YOUR FILES <span id="file-count">0</span></span><button id="refresh-files" class="icon-button" title="Refresh file list" aria-label="Refresh file list">↻</button></div>
+      <input id="file-search" type="search" placeholder="Find a CSV…" aria-label="Find a CSV file">
+      <nav id="file-list" aria-label="Select CSV file"></nav>
+      <div class="sidebar-footer"><span>CSV DIRECTORY</span><div id="directory"></div></div>
+    </aside>
+    <main>
+      <div class="toolbar">
+        <button id="toggle-sidebar" class="icon-button" title="Toggle CSV sidebar" aria-label="Toggle CSV sidebar" aria-controls="sidebar" aria-expanded="true">☰</button>
+        <div class="file-heading"><span class="eyebrow">CONTACT WORKSPACE</span><h1 id="file-title">Select a CSV</h1></div>
+        <div class="toolbar-actions"><button id="refresh-table" aria-label="Refresh CSV" disabled><span aria-hidden="true">↻</span> <span>Refresh CSV</span></button><button id="open-settings" aria-label="Settings"><span aria-hidden="true">⚙</span> <span>Settings</span></button></div>
+      </div>
+      <div class="table-tools">
+        <div class="stats"><strong id="row-count">0</strong> rows <span class="stat-divider">/</span> <span class="read-dot"></span><strong id="read-count">0</strong> read</div>
+        <label class="row-search"><span>⌕</span><input id="row-search" type="search" placeholder="Search this CSV…" aria-label="Search rows"></label>
+      </div>
+      <div id="table-viewport" tabindex="0" aria-label="CSV table; scroll horizontally to see more columns">
+        <table id="contacts"><caption class="sr-only">CSV contacts. Drag a column edge to resize. Copy cell text or open a link to mark its row as read.</caption><colgroup></colgroup><thead></thead><tbody></tbody></table>
+        <div id="empty-state"><span class="empty-icon">▤</span><h2>Your contacts, in one place.</h2><p>Select a CSV from the sidebar to start reviewing.</p></div>
+      </div>
+      <footer class="table-footer"><span id="copy-hint">Click a cell to copy · Copy text or open a link to mark as read</span><span>Drag column edges to resize</span></footer>
+      <div id="error-banner" role="alert" hidden><span id="error-message"></span><button id="dismiss-error" aria-label="Dismiss error">×</button></div>
+    </main>
+  </div>
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <div class="dialog-heading"><div><span class="eyebrow">MAKE IT YOURS</span><h2 id="settings-title">Workspace settings</h2></div><button id="close-settings" class="icon-button" aria-label="Close settings">×</button></div>
+    <div class="setting-row"><label for="copy-on-click"><strong>Copy on click</strong><span id="click-description">Copy the full cell value with one click.</span></label><input id="copy-on-click" type="checkbox" role="switch" aria-label="Copy on click" aria-describedby="click-description"></div>
+    <div class="setting-row"><label for="copy-on-drag"><strong>Copy a drag selection</strong><span id="drag-description">Automatically copy selected text when you release.</span></label><input id="copy-on-drag" type="checkbox" role="switch" aria-label="Copy a drag selection" aria-describedby="drag-description"></div>
+    <div class="setting-row"><label for="show-sidebar"><strong>Show CSV sidebar</strong><span id="sidebar-description">Keep your file list within reach.</span></label><input id="show-sidebar" type="checkbox" role="switch" aria-label="Show CSV sidebar" aria-describedby="sidebar-description"></div>
+    <div class="width-heading"><h3>Column widths</h3><span>Pixels · 64–1200</span></div>
+    <div id="column-settings"></div>
+    <p class="settings-note">Preferences are saved in this browser. Read checkboxes are saved in the selected CSV.</p>
+    <div class="dialog-footer"><button id="reset-settings">Restore defaults</button><button id="done-settings" class="primary">Done</button></div>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

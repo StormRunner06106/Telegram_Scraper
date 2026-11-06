@@ -130,7 +130,7 @@ def test_each_ray_region_worker_uses_five_validation_gates(tmp_path: Path) -> No
     state = core.RegionState(region_id=21, index=10, is_end=False, total_processed=10)
 
     with patch("githubscraper.ray_runner.get_region_by_id", return_value=region):
-        with patch("githubscraper.ray_runner.load_contacts", return_value=[]):
+        with patch("githubscraper.ray_runner.load_contact_family", return_value=[]):
             with patch("githubscraper.ray_runner.get_region_state", return_value=state):
                 with patch("githubscraper.ray_runner.scrape_region", return_value=0) as scrape:
                     result = _run_region_worker(21, str(output), None, 1.0, "token")

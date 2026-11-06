@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable
 
 from githubscraper.core import (
-    DEFAULT_CONTACTS_FILE,
+    OUTPUT_DIR,
     DEFAULT_VALIDATION_GATES,
     LOGGER,
     load_env_file,
@@ -134,11 +134,11 @@ def main() -> int:
         print("\nStarting Ray workers...")
         print("Candidate limit: none (processing until search partitions are exhausted)")
         print(f"Validation gates per Ray worker: {DEFAULT_VALIDATION_GATES}")
-        print(f"Combined output: {DEFAULT_CONTACTS_FILE}")
+        print(f"Location CSV folder: {OUTPUT_DIR}")
         if not token:
             print("Warning: GITHUB_TOKEN is not set; GitHub permits much lower API quotas.")
 
-        results, merged_count = run_parallel_scrape(
+        results, saved_count = run_parallel_scrape(
             region_ids=region_ids,
             delay_seconds=delay_seconds,
             token=token,
@@ -167,7 +167,7 @@ def main() -> int:
                 f"{result.region_name}: {result.added} contacts added, "
                 f"{result.processed} users processed ({status})"
             )
-    print(f"Merged {merged_count} unique contacts into {DEFAULT_CONTACTS_FILE}")
+    print(f"{saved_count} unique contacts saved in separate location CSVs under {OUTPUT_DIR}")
     return 1 if failed else 0
 
 

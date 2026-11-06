@@ -65,6 +65,10 @@ def run_in_tmux_if_needed() -> int | None:
 
 
 def entrypoint() -> int:
+    if sys.argv[1:2] == ["ui"]:
+        from githubscraper.ui import main as ui_main
+
+        return ui_main(sys.argv[2:])
     tmux_status = run_in_tmux_if_needed()
     if tmux_status is not None:
         return tmux_status

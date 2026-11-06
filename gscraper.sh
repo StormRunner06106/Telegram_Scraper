@@ -8,4 +8,4 @@ if ! command -v python3 &> /dev/null; then
 fi
 
 # Run gscraper
-python3 gscraper.py
+exec python3 "$(dirname "$0")/gscraper.py" "$@"

@@ -104,7 +104,7 @@ def test_region_runs_five_validation_gates_and_checks_each_user_once(tmp_path: P
                                     resume=True,
                                 )
 
-    contacts = core.load_contacts(output)
+    contacts = core.load_contact_family(output)
     assert added == len(users)
     assert peak_active == core.DEFAULT_VALIDATION_GATES
     assert len(worker_threads) == core.DEFAULT_VALIDATION_GATES
@@ -147,7 +147,7 @@ def test_duplicate_and_existing_links_are_never_dispatched_to_two_gates(
 
     assert sorted(assignments) == [(1, "duplicate"), (3, "unique")]
     assert added == 2
-    contacts = core.load_contacts(output)
+    contacts = core.load_contact_family(output)
     assert len(contacts) == 3
     assert len({contact.link.casefold() for contact in contacts}) == 3
     update_state.assert_called_with(21, 4, True, 4)
@@ -240,8 +240,16 @@ def test_resume_checkpoint_never_crosses_an_unfinished_gate(tmp_path: Path) -> N
             raise TimeoutError("test did not release the first gate")
         return _accepted_outcome(index, gate_id, user)
 
-    def recording_write(path: Path, contacts: list[core.Contact]) -> None:
-        original_write_contacts(path, contacts)
+    def recording_write(
+        path: Path,
+        contacts: list[core.Contact],
+        retry_on_permission: bool = True,
+    ) -> None:
+        original_write_contacts(
+            path,
+            contacts,
+            retry_on_permission=retry_on_permission,
+        )
         if len(contacts) >= 4:
             later_rows_persisted.set()
 
@@ -279,6 +287,6 @@ def test_resume_checkpoint_never_crosses_an_unfinished_gate(tmp_path: Path) -> N
     assert not scraper_thread.is_alive()
     assert not run_errors
     assert state_updates[-1] == (21, 5, True, 5)
-    contacts = core.load_contacts(output)
+    contacts = core.load_contact_family(output)
     assert len(contacts) == 5
     assert len({contact.link.casefold() for contact in contacts}) == 5

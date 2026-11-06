@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from http.client import HTTPException
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -24,6 +25,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from githubscraper.csv_storage import csv_lock, read_csv, read_flag, write_csv
+
 
 DEFAULT_COUNTRY = "United States"
 GITHUB_SEARCH_RESULT_LIMIT = 1000
@@ -31,6 +34,8 @@ MIN_GITHUB_BADGES = 3
 MIN_GITHUB_YEARS = 6
 MAX_GITHUB_YEARS = 20
 DEFAULT_VALIDATION_GATES = 5
+CONTACTS_PER_REGION_SHARD = 500
+CSV_PERMISSION_RETRY_MAX_SECONDS = 30
 GITHUB_PROFILE_URL_TEMPLATE = "https://github.com/{username}"
 GITHUB_SEARCH_URL = "https://api.github.com/search/users"
 GITHUB_USER_URL_TEMPLATE = "https://api.github.com/users/{username}"
@@ -39,13 +44,12 @@ USER_AGENT = "GithubScraper/0.1"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
-OUTPUT_DIR = DATA_DIR / "output"
+OUTPUT_DIR = PROJECT_ROOT / "new_output"
 STATE_DIR = DATA_DIR / "state"
 REGION_STATE_DIR = STATE_DIR / "regions"
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "github_scraper.txt"
-DEFAULT_CONTACTS_FILE = OUTPUT_DIR / "contacts.csv"
-CSV_FIELDNAMES = ["link", "email", "telegramId", "blog", "years", "company", "nameMatch"]
+CSV_FIELDNAMES = ["link", "email", "telegramId", "blog", "years", "company", "nameMatch", "is_read"]
 REGIONS_FILE = CONFIG_DIR / "regions.json"
 STATE_FILE = STATE_DIR / "state.json"
 SEARCH_START_YEAR = 2008
@@ -72,6 +76,8 @@ NORMAL_BIG_COMPANIES = {
 }
 
 LOGGER = logging.getLogger("githubscraper")
+_CSV_FAMILY_LOCKS: dict[str, Lock] = {}
+_CSV_FAMILY_LOCKS_GUARD = Lock()
 
 
 def setup_logging(log_path: Path | None = None) -> Path:
@@ -142,6 +148,7 @@ class Contact:
     years: int
     company: str
     nameMatch: str
+    is_read: bool = False
 
 
 @dataclass
@@ -183,6 +190,21 @@ def get_region_location(region: dict[str, Any]) -> str:
         str(region.get("country") or DEFAULT_COUNTRY).strip(),
     ]
     return ", ".join(part for part in parts if part)
+
+
+def region_output_path(region: dict[str, Any], output_dir: Path | None = None) -> Path:
+    """Build the logical base path for one region's numbered CSV family."""
+    destination = output_dir or OUTPUT_DIR
+    slug = re.sub(r"[^a-z0-9]+", "_", str(region.get("name") or "region").lower()).strip("_")
+    return destination / f"{int(region['id']):02d}_{slug}.csv"
+
+
+def location_output_path(location: str, output_dir: Path | None = None) -> Path:
+    """Keep each custom location in its own safely named CSV."""
+    slug = re.sub(r"[^\w]+", "_", location.casefold()).strip("_")
+    if not slug:
+        raise ValueError("Location must contain letters or numbers.")
+    return (output_dir or OUTPUT_DIR) / f"{slug}.csv"
 
 
 def load_state() -> list[dict[str, Any]]:
@@ -893,39 +915,379 @@ def telegram_account_exists(username: str) -> tuple[bool, str]:
     return True, ""
 
 
-def load_contacts(path: Path) -> list[Contact]:
+def _permission_retry_delay(attempt: int) -> int:
+    return min(2 ** min(max(0, attempt - 1), 5), CSV_PERMISSION_RETRY_MAX_SECONDS)
+
+
+def load_contacts(path: Path, retry_on_permission: bool = True) -> list[Contact]:
+    """Load one CSV, waiting instead of crashing when another program locks it."""
     if not path.exists():
         return []
 
-    with path.open("r", encoding="utf-8", newline="") as file:
-        reader = csv.DictReader(file)
-        contacts = []
-        for row in reader:
-            if not row.get("link"):
-                continue
-            contacts.append(
-                Contact(
-                    link=row.get("link", ""),
-                    email=row.get("email", ""),
-                    telegramId=row.get("telegramId", ""),
-                    blog=row.get("blog", ""),
-                    years=int(row.get("years") or 0),
-                    company=row.get("company", ""),
-                    nameMatch=row.get("nameMatch", ""),
+    attempt = 0
+    while True:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as file:
+                reader = csv.DictReader(file)
+                contacts = []
+                for row in reader:
+                    if not row.get("link"):
+                        continue
+                    contacts.append(
+                        Contact(
+                            link=row.get("link", ""),
+                            email=row.get("email", ""),
+                            telegramId=row.get("telegramId", ""),
+                            blog=row.get("blog", ""),
+                            years=int(row.get("years") or 0),
+                            company=row.get("company", ""),
+                            nameMatch=row.get("nameMatch", ""),
+                            is_read=read_flag(row.get("is_read", "")),
+                        )
+                    )
+                return contacts
+        except PermissionError as error:
+            if not retry_on_permission:
+                raise
+            attempt += 1
+            wait_seconds = _permission_retry_delay(attempt)
+            print(
+                f"CSV is locked and cannot be read: {path}. Retrying in "
+                f"{wait_seconds} seconds...",
+                file=sys.stderr,
+            )
+            LOGGER.warning(
+                "CSV read blocked path=%s attempt=%s wait_seconds=%s error=%s",
+                path,
+                attempt,
+                wait_seconds,
+                error,
+            )
+            time.sleep(wait_seconds)
+
+
+def _write_contacts_once(path: Path, contacts: list[Contact]) -> None:
+    """Keep UI edits when an active worker rewrites its cached contacts."""
+    with csv_lock(path):
+        fields, existing, has_bom = read_csv(path) if path.exists() else ([], [], False)
+        previous = {row.get("link", "").casefold(): row for row in existing}
+        output_fields = [*CSV_FIELDNAMES, *(field for field in fields if field not in CSV_FIELDNAMES)]
+        rows = []
+        for contact in contacts:
+            old = previous.get(contact.link.casefold(), {})
+            row = {**old, **asdict(contact)}
+            # Both checked and manually unchecked values on disk are authoritative.
+            row["is_read"] = "true" if read_flag(old.get("is_read", contact.is_read)) else "false"
+            rows.append(row)
+        write_csv(path, output_fields, rows, has_bom)
+
+
+def write_contacts(
+    path: Path,
+    contacts: list[Contact],
+    retry_on_permission: bool = True,
+) -> None:
+    """Write one CSV atomically and keep retrying a locked final destination."""
+    attempt = 0
+    while True:
+        try:
+            _write_contacts_once(path, contacts)
+            return
+        except PermissionError as error:
+            if not retry_on_permission:
+                raise
+            attempt += 1
+            wait_seconds = _permission_retry_delay(attempt)
+            print(
+                f"CSV is locked and cannot be replaced: {path}. Retrying in "
+                f"{wait_seconds} seconds; press Ctrl+C to stop...",
+                file=sys.stderr,
+            )
+            LOGGER.warning(
+                "CSV write blocked path=%s attempt=%s wait_seconds=%s error=%s",
+                path,
+                attempt,
+                wait_seconds,
+                error,
+            )
+            time.sleep(wait_seconds)
+
+
+def contact_shard_path(base_path: Path, shard_number: int) -> Path:
+    """Return ``name_1.csv``, ``name_2.csv``, and so on for a logical base."""
+    if shard_number < 1:
+        raise ValueError("shard_number must be at least 1.")
+    return base_path.with_name(f"{base_path.stem}_{shard_number}{base_path.suffix}")
+
+
+def contact_shard_paths(base_path: Path) -> list[Path]:
+    """Discover a contact family in numeric order without matching temp files."""
+    if not base_path.parent.exists():
+        return []
+    pattern = re.compile(
+        rf"^{re.escape(base_path.stem)}_(\d+){re.escape(base_path.suffix)}$",
+        re.IGNORECASE,
+    )
+    matches: list[tuple[int, Path]] = []
+    for candidate in base_path.parent.iterdir():
+        if not candidate.is_file():
+            continue
+        match = pattern.fullmatch(candidate.name)
+        if match:
+            matches.append((int(match.group(1)), candidate))
+    return [path for _, path in sorted(matches, key=lambda item: item[0])]
+
+
+def failed_contact_temp_paths(base_path: Path) -> list[Path]:
+    """Find complete atomic-write temps left by the older writer after a lock."""
+    if not base_path.parent.exists():
+        return []
+    prefix = f".{base_path.name}."
+    return sorted(
+        path
+        for path in base_path.parent.iterdir()
+        if path.is_file() and path.name.startswith(prefix) and path.name.endswith(".tmp")
+    )
+
+
+def load_contact_family(base_path: Path) -> list[Contact]:
+    """Load and deduplicate a logical region across legacy, temp, and shard files."""
+    paths: list[Path] = []
+    if base_path.exists():
+        paths.append(base_path)
+    paths.extend(contact_shard_paths(base_path))
+    paths.extend(failed_contact_temp_paths(base_path))
+
+    contacts_by_link: dict[str, Contact] = {}
+    for path in paths:
+        try:
+            contacts = load_contacts(path)
+        except (csv.Error, TypeError, ValueError) as error:
+            print(f"Ignoring unreadable contact recovery file {path}: {error}", file=sys.stderr)
+            LOGGER.warning("Contact CSV ignored path=%s error=%s", path, error)
+            continue
+        for contact in contacts:
+            contacts_by_link[contact.link.casefold()] = contact
+    return list(contacts_by_link.values())
+
+
+def _archive_contact_file(path: Path) -> bool:
+    """Move a superseded file into a recoverable archive without stopping work."""
+    if not path.exists():
+        return True
+    archive_dir = path.parent / "legacy"
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        destination = archive_dir / path.name
+        suffix = 1
+        while destination.exists():
+            destination = archive_dir / f"{path.name}.{suffix}"
+            suffix += 1
+        path.replace(destination)
+        return True
+    except OSError as error:
+        print(
+            f"Could not archive legacy CSV {path}; it will be ignored through "
+            f"link deduplication and retried next run: {error}",
+            file=sys.stderr,
+        )
+        LOGGER.warning("Legacy contact CSV archive deferred path=%s error=%s", path, error)
+        return False
+
+
+def migrate_contact_file_to_shards(
+    base_path: Path,
+    shard_size: int = CONTACTS_PER_REGION_SHARD,
+) -> list[Path]:
+    """Crash-safely split a legacy region family and archive superseded files."""
+    if shard_size < 1:
+        raise ValueError("shard_size must be at least 1.")
+
+    original_shards = contact_shard_paths(base_path)
+    recovery_temps = failed_contact_temp_paths(base_path)
+    contacts = load_contact_family(base_path)
+    desired_paths: list[Path] = []
+    for offset in range(0, len(contacts), shard_size):
+        shard_number = (offset // shard_size) + 1
+        shard_path = contact_shard_path(base_path, shard_number)
+        write_contacts(shard_path, contacts[offset : offset + shard_size])
+        desired_paths.append(shard_path)
+
+    desired_names = {path.name.casefold() for path in desired_paths}
+    for extra_shard in original_shards:
+        if extra_shard.name.casefold() not in desired_names:
+            _archive_contact_file(extra_shard)
+
+    # Numbered shards are durable before any source is moved. A lock on the
+    # legacy file therefore cannot lose data or terminate the scraper.
+    if base_path.exists():
+        _archive_contact_file(base_path)
+    for recovery_path in recovery_temps:
+        _archive_contact_file(recovery_path)
+
+    return desired_paths
+
+
+def ensure_region_contact_shards(
+    base_path: Path,
+    shard_size: int = CONTACTS_PER_REGION_SHARD,
+) -> list[Path]:
+    """Finish an interrupted legacy migration when numbered coverage is missing."""
+    shards = contact_shard_paths(base_path)
+    legacy_paths = ([base_path] if base_path.exists() else []) + failed_contact_temp_paths(base_path)
+    oversized = any(len(load_contacts(path)) > shard_size for path in shards)
+    if not legacy_paths and not oversized:
+        return shards
+
+    shard_links = {
+        contact.link.casefold()
+        for shard_path in shards
+        for contact in load_contacts(shard_path)
+    }
+    legacy_links = {
+        contact.link.casefold()
+        for legacy_path in legacy_paths
+        for contact in load_contacts(legacy_path)
+    }
+    if oversized or not shards or not legacy_links.issubset(shard_links):
+        return migrate_contact_file_to_shards(base_path, shard_size)
+
+    for legacy_path in legacy_paths:
+        _archive_contact_file(legacy_path)
+    return shards
+
+
+@dataclass
+class _ContactShard:
+    number: int
+    path: Path
+    contacts: list[Contact]
+    sealed: bool = False
+
+
+class RegionContactCsvStore:
+    """Single-writer, deduplicated storage for one region's numbered CSVs."""
+
+    def __init__(
+        self,
+        base_path: Path,
+        shard_size: int = CONTACTS_PER_REGION_SHARD,
+    ) -> None:
+        if shard_size < 1:
+            raise ValueError("shard_size must be at least 1.")
+        self.base_path = base_path
+        self.shard_size = shard_size
+        ensure_region_contact_shards(base_path, shard_size)
+        self._shards = [
+            _ContactShard(
+                number=int(path.stem.rsplit("_", 1)[1]),
+                path=path,
+                contacts=load_contacts(path),
+            )
+            for path in contact_shard_paths(base_path)
+        ]
+        self._contacts_by_link = {
+            contact.link.casefold(): contact for contact in load_contact_family(base_path)
+        }
+
+    @property
+    def link_keys(self) -> set[str]:
+        return set(self._contacts_by_link)
+
+    @property
+    def contacts(self) -> list[Contact]:
+        return list(self._contacts_by_link.values())
+
+    @property
+    def shard_paths(self) -> list[Path]:
+        return [shard.path for shard in self._shards]
+
+    def _active_shard(self) -> _ContactShard:
+        if (
+            not self._shards
+            or self._shards[-1].sealed
+            or len(self._shards[-1].contacts) >= self.shard_size
+        ):
+            next_number = self._shards[-1].number + 1 if self._shards else 1
+            self._shards.append(
+                _ContactShard(
+                    number=next_number,
+                    path=contact_shard_path(self.base_path, next_number),
+                    contacts=[],
                 )
             )
-        return contacts
+        return self._shards[-1]
 
-
-def write_contacts(path: Path, contacts: list[Contact]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.{get_ident()}.tmp")
-    with temporary_path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDNAMES)
-        writer.writeheader()
+    def append_unique(self, contacts: list[Contact]) -> set[str]:
+        """Durably append unique contacts, rotating away from an Excel lock."""
+        pending: list[Contact] = []
+        pending_keys: set[str] = set()
         for contact in contacts:
-            writer.writerow(asdict(contact))
-    temporary_path.replace(path)
+            link_key = contact.link.casefold()
+            if link_key in self._contacts_by_link or link_key in pending_keys:
+                continue
+            pending.append(contact)
+            pending_keys.add(link_key)
+
+        persisted_keys: set[str] = set()
+        fresh_shard_attempt = 0
+        while pending:
+            shard = self._active_shard()
+            capacity = self.shard_size - len(shard.contacts)
+            portion = pending[:capacity]
+            proposed_contacts = [*shard.contacts, *portion]
+            target_existed = shard.path.exists()
+            try:
+                write_contacts(
+                    shard.path,
+                    proposed_contacts,
+                    retry_on_permission=False,
+                )
+            except PermissionError as error:
+                if target_existed:
+                    shard.sealed = True
+                    fresh_shard_attempt = 0
+                    print(
+                        f"Region CSV is open or locked: {shard.path}. Continuing in "
+                        "the next numbered CSV without stopping the scraper.",
+                        file=sys.stderr,
+                    )
+                    LOGGER.warning(
+                        "Locked region shard sealed path=%s rows=%s error=%s",
+                        shard.path,
+                        len(shard.contacts),
+                        error,
+                    )
+                    continue
+
+                # A brand-new destination failing indicates a broader filesystem
+                # problem. Retrying preserves the pending lead and state cursor.
+                fresh_shard_attempt += 1
+                wait_seconds = _permission_retry_delay(fresh_shard_attempt)
+                print(
+                    f"Cannot create new region CSV {shard.path}: {error}. Retrying in "
+                    f"{wait_seconds} seconds; press Ctrl+C to stop...",
+                    file=sys.stderr,
+                )
+                LOGGER.warning(
+                    "New region shard write blocked path=%s attempt=%s wait_seconds=%s error=%s",
+                    shard.path,
+                    fresh_shard_attempt,
+                    wait_seconds,
+                    error,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            fresh_shard_attempt = 0
+            shard.contacts = proposed_contacts
+            for contact in portion:
+                link_key = contact.link.casefold()
+                self._contacts_by_link[link_key] = contact
+                persisted_keys.add(link_key)
+            del pending[: len(portion)]
+
+        return persisted_keys
 
 
 def upsert_contact(path: Path, contacts: list[Contact], contact: Contact) -> list[Contact]:
@@ -1118,12 +1480,13 @@ def validate_user_in_gate(
 
 def scrape(
     location: str,
-    output_path: Path,
+    output_path: Path | None = None,
     max_results: int | None = None,
     delay_seconds: float = 1.0,
     token: str | None = None,
 ) -> int:
     normalized_location = normalize_location(location)
+    output_path = output_path or location_output_path(location)
     print(f"Searching GitHub users in: {normalized_location}")
     LOGGER.info(
         "Custom scrape started location=%s max_results=%s output=%s authenticated=%s",
@@ -1232,7 +1595,7 @@ def scrape(
 
 def scrape_region(
     region_id: int,
-    output_path: Path,
+    output_path: Path | None = None,
     max_results: int | None = None,
     delay_seconds: float = 1.0,
     token: str | None = None,
@@ -1248,6 +1611,7 @@ def scrape_region(
         print(f"Region ID {region_id} not found in {REGIONS_FILE}", file=sys.stderr)
         return 0
     
+    output_path = output_path or region_output_path(region)
     location = get_region_location(region)
     
     print(f"Scraping region {region_id}: {region.get('name', location)}")
@@ -1275,10 +1639,8 @@ def scrape_region(
         print(f"Resuming from index {start_index} (already processed {total_processed} users)")
     
     normalized_location = normalize_location(location)
-    contacts_by_link = {
-        contact.link.casefold(): contact for contact in load_contacts(output_path)
-    }
-    assigned_links = set(contacts_by_link)
+    contact_store = RegionContactCsvStore(output_path)
+    assigned_links = contact_store.link_keys
 
     # A capped resumed batch must rebuild a stable prefix through the saved
     # index. Unlimited runs enumerate every supported search partition.
@@ -1327,23 +1689,17 @@ def scrape_region(
     def persist_finished_outcomes(outcomes: list[ValidationOutcome]) -> None:
         """Persist gate results centrally before making them resumably complete."""
         nonlocal added
-        new_contacts: list[ValidationOutcome] = []
-        for outcome in outcomes:
-            if outcome.contact is None:
-                continue
-            link_key = outcome.contact.link.casefold()
-            if link_key in contacts_by_link:
-                continue
-            contacts_by_link[link_key] = outcome.contact
-            new_contacts.append(outcome)
-
-        if new_contacts:
-            # Only this coordinator writes the region CSV. The atomic replace in
-            # write_contacts prevents a killed worker from leaving a partial file.
-            write_contacts(output_path, list(contacts_by_link.values()))
-            added += len(new_contacts)
-
-        new_contact_indexes = {outcome.index for outcome in new_contacts}
+        contacts_to_save = [
+            outcome.contact for outcome in outcomes if outcome.contact is not None
+        ]
+        persisted_keys = contact_store.append_unique(contacts_to_save)
+        added += len(persisted_keys)
+        new_contact_indexes = {
+            outcome.index
+            for outcome in outcomes
+            if outcome.contact is not None
+            and outcome.contact.link.casefold() in persisted_keys
+        }
         for outcome in sorted(outcomes, key=lambda item: item.index):
             label = (
                 f"region {region_id}/g{outcome.gate_id}"
@@ -1498,6 +1854,11 @@ def scrape_region(
         print(f"Progress saved. {visible_remaining} users currently available after the saved index.")
 
     print(f"Upserted {added} leads to {output_path}")
+    if contact_store.shard_paths:
+        print(
+            "Region CSV shards: "
+            + ", ".join(str(path) for path in contact_store.shard_paths)
+        )
     print(f"Total processed: {total_processed} users")
     LOGGER.info(
         "Region scrape batch finished region_id=%s current_index=%s total_processed=%s "
@@ -1532,8 +1893,8 @@ def parse_args() -> argparse.Namespace:
     location_parser.add_argument(
         "-o",
         "--output",
-        default=str(DEFAULT_CONTACTS_FILE),
-        help=f"CSV output file path. Defaults to {DEFAULT_CONTACTS_FILE}.",
+        default=None,
+        help="CSV output file path. Defaults to new_output/<location>.csv.",
     )
     location_parser.add_argument(
         "--max-results",
@@ -1566,8 +1927,11 @@ def parse_args() -> argparse.Namespace:
     region_parser.add_argument(
         "-o",
         "--output",
-        default=str(DEFAULT_CONTACTS_FILE),
-        help=f"CSV output file path. Defaults to {DEFAULT_CONTACTS_FILE}.",
+        default=None,
+        help=(
+            "Logical region CSV base path. By default a region-specific path "
+            "under new_output is used and split into 500-row shards."
+        ),
     )
     region_parser.add_argument(
         "--max-results",
@@ -1621,9 +1985,19 @@ def main() -> int:
             return 2
         
         try:
+            selected_region = get_region_by_id(args.region_id)
+            region_output = (
+                Path(args.output)
+                if args.output
+                else (
+                    region_output_path(selected_region)
+                    if selected_region is not None
+                    else OUTPUT_DIR / f"region_{args.region_id}.csv"
+                )
+            )
             scrape_region(
                 region_id=args.region_id,
-                output_path=Path(args.output),
+                output_path=region_output,
                 max_results=args.max_results,
                 delay_seconds=args.delay,
                 token=args.github_token,
@@ -1670,7 +2044,7 @@ def main() -> int:
         try:
             scrape(
                 location=args.location,
-                output_path=Path(args.output),
+                output_path=Path(args.output) if args.output else None,
                 max_results=args.max_results,
                 delay_seconds=args.delay,
                 token=args.github_token,

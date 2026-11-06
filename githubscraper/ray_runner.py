@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from githubscraper.core import (
     DEFAULT_VALIDATION_GATES,
-    DEFAULT_CONTACTS_FILE,
-    OUTPUT_DIR,
     get_region_by_id,
     get_region_state,
+    load_contact_family,
     load_contacts,
+    region_output_path,
     scrape_region,
     write_contacts,
 )
@@ -30,19 +29,12 @@ class WorkerResult:
     error: str = ""
 
 
-def region_output_path(region: dict[str, Any], output_dir: Path | None = None) -> Path:
-    """Build a stable output path for one region worker."""
-    destination = output_dir or OUTPUT_DIR / "regions"
-    slug = re.sub(r"[^a-z0-9]+", "_", str(region.get("name") or "region").lower()).strip("_")
-    return destination / f"{int(region['id']):02d}_{slug}.csv"
-
-
-def merge_contact_files(paths: Iterable[Path], destination: Path = DEFAULT_CONTACTS_FILE) -> int:
-    """Merge worker CSVs into one deduplicated contact file."""
-    contacts_by_link = {contact.link.lower(): contact for contact in load_contacts(destination)}
+def merge_contact_files(paths: Iterable[Path], destination: Path) -> int:
+    """Explicit export helper; scraping never merges location files automatically."""
+    contacts_by_link = {contact.link.casefold(): contact for contact in load_contacts(destination)}
     for path in paths:
-        for contact in load_contacts(path):
-            contacts_by_link[contact.link.lower()] = contact
+        for contact in load_contact_family(path):
+            contacts_by_link[contact.link.casefold()] = contact
 
     contacts = list(contacts_by_link.values())
     write_contacts(destination, contacts)
@@ -51,7 +43,7 @@ def merge_contact_files(paths: Iterable[Path], destination: Path = DEFAULT_CONTA
 
 def merge_worker_outputs(
     results: Iterable[WorkerResult],
-    destination: Path = DEFAULT_CONTACTS_FILE,
+    destination: Path,
 ) -> int:
     """Merge saved output even when a worker reports a recoverable failure."""
     return merge_contact_files((Path(result.output_path) for result in results), destination)
@@ -68,7 +60,9 @@ def _run_region_worker(
     """Execute one region inside a Ray worker process."""
     region = get_region_by_id(region_id)
     region_name = str(region.get("name")) if region else f"Region {region_id}"
-    starting_links = {contact.link.lower() for contact in load_contacts(Path(output_path))}
+    starting_links = {
+        contact.link.casefold() for contact in load_contact_family(Path(output_path))
+    }
     try:
         added = scrape_region(
             region_id=region_id,
@@ -89,7 +83,9 @@ def _run_region_worker(
             completed=state.is_end,
         )
     except Exception as error:  # Ray must return other workers' results if one location fails.
-        current_links = {contact.link.lower() for contact in load_contacts(Path(output_path))}
+        current_links = {
+            contact.link.casefold() for contact in load_contact_family(Path(output_path))
+        }
         result = WorkerResult(
             region_id=region_id,
             region_name=region_name,
@@ -107,10 +103,9 @@ def run_parallel_scrape(
     max_results: int | None = None,
     delay_seconds: float = 1.0,
     token: str | None = None,
-    destination: Path = DEFAULT_CONTACTS_FILE,
     validation_gates: int = DEFAULT_VALIDATION_GATES,
 ) -> tuple[list[WorkerResult], int]:
-    """Run one Ray process per region, each with parallel validation gates."""
+    """Return worker results and a unique contact count, keeping CSVs separate."""
     if not region_ids:
         raise ValueError("Select at least one region.")
     if len(region_ids) != len(set(region_ids)):
@@ -166,5 +161,9 @@ def run_parallel_scrape(
             ray.shutdown()
 
     results = [WorkerResult(**payload) for payload in payloads]
-    merged_count = merge_worker_outputs(results, destination)
-    return results, merged_count
+    saved_links = {
+        contact.link.casefold()
+        for result in results
+        for contact in load_contact_family(Path(result.output_path))
+    }
+    return results, len(saved_links)

@@ -2,7 +2,7 @@
 REM GScraper launcher for Windows
 
 REM Check if Python is available
-python --version >nul 2>&1
+call python --version >nul 2>&1
 if errorlevel 1 (
     echo Error: Python not found. Please install Python 3.10+
     pause
@@ -10,6 +10,6 @@ if errorlevel 1 (
 )
 
 REM Run gscraper
-python gscraper.py
+call python "%~dp0gscraper.py" %*
 
-pause
+exit /b %errorlevel%
