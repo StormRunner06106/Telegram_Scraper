@@ -158,8 +158,9 @@ def main() -> int:
         if result.error:
             failed = True
             print(
-                f"{result.region_name}: FAILED after {result.processed} users processed; "
-                f"{result.added} new contacts saved - {result.error}"
+                f"{result.region_name}: FAILED - {result.error}; "
+                f"saved location checkpoint: {result.processed} users; "
+                f"{result.added} new contacts present since worker startup"
             )
         else:
             status = "complete" if result.completed else "progress saved"

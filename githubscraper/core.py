@@ -1574,9 +1574,46 @@ def scrape_region(
     output_path = output_path or region_output_path(region)
     policy = validation_policy(build_location_query(get_region_location(region)),
                                MIN_GITHUB_YEARS, MAX_GITHUB_YEARS, MIN_GITHUB_BADGES)
+    waited_for_run = False
+
+    def report_lock_wait() -> None:
+        nonlocal waited_for_run
+        waited_for_run = True
+        message = (
+            f"{region.get('name', region_id)}: another process holds the region run lock. "
+            "Waiting; this worker will resume from saved progress after it releases the lock."
+        )
+        status_path = output_path.parent / ".scraper-state" / f"{output_path.stem}.status.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = None
+        # Read-only: a waiting worker must never overwrite the owner's status,
+        # open/reset its journal, or claim that it processed the owner's users.
+        if isinstance(status, dict):
+            message += (
+                f" Last owner status: PID {status.get('pid', '?')}, {status.get('stage', '?')}; "
+                f"{status.get('resolved_profiles', '?')}/{status.get('discovered_profiles', '?')} "
+                f"profiles resolved, {status.get('pending_profiles', '?')} pending, "
+                f"{status.get('saved_contacts', '?')} saved contacts "
+                f"(updated {status.get('updated_at', '?')})."
+            )
+        message += " Ctrl+C cancels this waiting run."
+        print(message, flush=True)
+        LOGGER.info(message)
+
     # Serialize runs for this output as well as its journal. Other regions and
-    # the CSV browser can continue independently.
-    with csv_lock(output_path.parent / ".scraper-state" / f"{output_path.stem}.run"):
+    # the CSV browser can continue independently. This is a long-lived run
+    # lock, not a five-second CSV edit: wait until the owner finishes or exits.
+    with csv_lock(
+        output_path.parent / ".scraper-state" / f"{output_path.stem}.run",
+        timeout=None,
+        on_wait=report_lock_wait,
+    ):
+        if waited_for_run:
+            message = f"{region.get('name', region_id)}: run lock acquired; reloading saved progress."
+            print(message, flush=True)
+            LOGGER.info(message)
         journal = ValidationJournal(output_path, policy, resume)
         try:
             return _scrape_region(region_id, output_path, max_results, delay_seconds,

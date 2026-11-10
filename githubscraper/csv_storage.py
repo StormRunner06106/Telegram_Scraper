@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import errno
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -15,11 +17,18 @@ def read_flag(value: object) -> bool:
 
 
 @contextmanager
-def csv_lock(path: Path, timeout: float = 5.0):
+def csv_lock(
+    path: Path,
+    timeout: float | None = 5.0,
+    *,
+    on_wait: Callable[[], None] | None = None,
+):
     """Coordinate read/modify/replace across UI requests and scraper processes.
 
     Lock a stable sibling file: locking the CSV itself would prevent atomic
     replacement on Windows and would lock an obsolete inode on POSIX.
+    A run lasting hours uses timeout=None; UI writes keep the short timeout.
+    on_wait reports contention immediately and every 30 seconds thereafter.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(f".{path.name}.lock").open("a+b") as lock:
@@ -27,7 +36,8 @@ def csv_lock(path: Path, timeout: float = 5.0):
         if lock.tell() == 0:
             lock.write(b"\0")
             lock.flush()
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        next_wait_report = None
         while True:
             try:
                 lock.seek(0)
@@ -40,10 +50,18 @@ def csv_lock(path: Path, timeout: float = 5.0):
 
                     fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError:
-                if time.monotonic() >= deadline:
+            except OSError as error:
+                # Only lock contention is retryable. Bad handles, unsupported
+                # locking, and other OS failures must keep their real cause.
+                if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
                     raise PermissionError(f"CSV is busy: {path.name}") from None
-                time.sleep(0.05)
+                if on_wait is not None and (next_wait_report is None or now >= next_wait_report):
+                    on_wait()
+                    next_wait_report = now + 30
+                time.sleep(0.5 if timeout is None else 0.05)
         try:
             yield
         finally:

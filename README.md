@@ -57,7 +57,14 @@ An identity journal under `new_output/.scraper-state/` records each successful
 validation after its contact is durable. Resume uses GitHub account IDs (or
 profile links for legacy candidates), so changed search ordering cannot skip
 profiles. Request failures remain retryable. Deleted contact rows are checked
-again on the next run. Independent runs targeting the same output are locked.
+again on the next run. Independent runs targeting the same output are serialized
+with a region run lock. If another process already owns that region, the new
+worker waits without a timeout, reports the owner's last saved coverage every
+30 seconds, and resumes from the journal when the lock is released. The active
+worker continues scanning. `Ctrl+C` cancels the waiting run. A process exit also
+releases its OS lock; the remaining `.lock` file does not mean it is busy, and
+must not be deleted to bypass an active worker. Waiting workers do not modify
+the active worker's CSVs, journal, or status.
 
 Each region is stored in numbered CSV shards containing at most 500 contacts:
 
