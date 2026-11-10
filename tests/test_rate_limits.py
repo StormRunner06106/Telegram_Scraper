@@ -138,7 +138,7 @@ def test_interrupted_http_error_body_retries_original_request() -> None:
 def test_telegram_lookup_uses_retrying_text_request() -> None:
     html = (
         '<div class="tgme_page_title">Octo Cat</div>'
-        '<a class="tgme_username_link">You can contact @octocat right away</a>'
+        '<div class="tgme_page_extra">@octocat</div>'
     )
     with patch("githubscraper.core.request_text", return_value=html) as mocked_request:
         exists, full_name = core.telegram_account_exists("octocat")

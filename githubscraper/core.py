@@ -15,6 +15,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from http.client import HTTPException
+from html import unescape
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -834,7 +835,9 @@ def extract_telegram_full_name(username: str) -> str:
 
 
 def telegram_account_exists(username: str) -> tuple[bool, str]:
-    """Check if Telegram account exists and return (exists, full_name)."""
+    """Require a public profile card displaying the exact requested handle."""
+    if not re.fullmatch(r"[A-Za-z0-9_]+", username):
+        return False, ""
     try:
         html = request_text(
             TELEGRAM_URL_TEMPLATE.format(username=username),
@@ -845,27 +848,19 @@ def telegram_account_exists(username: str) -> tuple[bool, str]:
             return False, ""
         raise
 
-    html_lower = html.lower()
-    normalized_username = username.lower()
-    contact_text = f"you can contact @{normalized_username} right away"
-    if "username not found" in html_lower:
-        return False, ""
+    def profile_field(class_name: str) -> str:
+        match = re.search(
+            r'<div\b[^>]*\bclass=["\'][^"\']*\b' + re.escape(class_name)
+            + r'\b[^"\']*["\'][^>]*>(.*?)</div>', html, re.IGNORECASE | re.DOTALL,
+        )
+        return unescape(re.sub(r"<[^>]*>", "", match.group(1))).strip() if match else ""
 
-    exists = contact_text in html_lower or (
-        "tgme_page_title" in html_lower and "tgme_username_link" in html_lower
-    )
-    if not exists:
-        return False, ""
-
-    match = re.search(r'<span[^>]*dir="auto"[^>]*>([^<]+)</span>', html)
-    if match:
-        return True, match.group(1).strip()
-
-    match = re.search(r'<div[^>]*class="[^"]*tgme_page_title[^"]*"[^>]*>([^<]+)</div>', html)
-    if match:
-        return True, match.group(1).strip()
-
-    return True, ""
+    title = profile_field("tgme_page_title")
+    handle = profile_field("tgme_page_extra")
+    matches = re.search(r"(?<![\w@])@" + re.escape(username) + r"(?![\w])", handle, re.IGNORECASE)
+    # Generic "you can contact @..." landing pages also exist for unavailable
+    # usernames. Neither that wording nor an unrelated profile is confirmation.
+    return (True, title) if title and matches else (False, "")
 
 
 def _permission_retry_delay(attempt: int) -> int:
@@ -1440,43 +1435,6 @@ def validate_user_in_gate(
     )
 
 
-def export_discovered_profiles(
-    output_path: Path,
-    users: list[dict[str, str]],
-    *,
-    location: str = "",
-    incomplete: bool = True,
-) -> Path:
-    """Keep the full discovery list separate from qualified contact shards."""
-    path = output_path.parent / "profiles" / output_path.name
-    with csv_lock(path):
-        fields = ["id", "username", "link"]
-        previous_rows: dict[str, dict[str, str]] = {}
-        has_bom = False
-        if path.exists():
-            previous_fields, rows, has_bom = read_csv(path)
-            fields.extend(field for field in previous_fields if field not in fields)
-            previous_rows = {row.get("link", "").casefold(): row for row in rows}
-        write_csv(path, fields, [
-            {**previous_rows.get(user["github_url"].casefold(), {}),
-             "id": user.get("id", ""), "username": user["username"], "link": user["github_url"]}
-            for user in users
-        ], has_bom)
-        metadata = {
-            "query": build_location_query(location) if location else "",
-            "discovered_profiles": len(users),
-            "search_complete": not incomplete,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "contact_filters_applied": False,
-        }
-        metadata_path = path.with_suffix(".json")
-        temporary = metadata_path.with_suffix(f".{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        temporary.replace(metadata_path)
-    print(f"Discovered profile list: {path} ({len(users)} profiles)")
-    return path
-
-
 def scrape(
     location: str,
     output_path: Path | None = None,
@@ -1504,10 +1462,9 @@ def scrape(
         print(error, file=sys.stderr)
         return 0
 
-    export_discovered_profiles(output_path, github_users, location=normalized_location, incomplete=has_more)
     print(f"Found {len(github_users)} GitHub users. Checking account age, badges, and Telegram usernames...")
     if has_more:
-        print("Profile discovery is incomplete; see the profile export's JSON metadata.", file=sys.stderr)
+        print("Profile discovery is incomplete; the run cannot claim full location coverage.", file=sys.stderr)
 
     added = 0
     processed = 0
@@ -1681,17 +1638,32 @@ def _scrape_region(
         max_results,
         search_target,
     )
-    try:
-        github_users, has_more = search_github_users(
-            normalized_location,
-            max_results=search_target,
-            token=token,
-        )
-    except GitHubRateLimitError as error:
-        print(error, file=sys.stderr)
-        return 0
+    cached = journal.load_candidates()
+    pending_cached = cached and any(
+        candidate_key(user) not in completed_keys and user["github_url"].casefold() not in assigned_links
+        for user in cached[0]
+    )
+    if pending_cached:
+        github_users, has_more = cached
+        print(f"Continuing the saved validation queue of {len(github_users)} profiles.")
+    else:
+        journal.write_status({
+            "region_id": region_id, "stage": "discovering", "search_complete": False,
+            "validation_complete": False, "saved_contacts": len(contact_store.link_keys),
+        })
+        try:
+            github_users, has_more = search_github_users(
+                normalized_location, max_results=search_target, token=token,
+            )
+        except GitHubRateLimitError as error:
+            journal.write_status({"region_id": region_id, "stage": "interrupted", "validation_complete": False})
+            print(error, file=sys.stderr)
+            return 0
+        except BaseException:
+            journal.write_status({"region_id": region_id, "stage": "interrupted", "validation_complete": False})
+            raise
+        journal.save_candidates(github_users, has_more)
 
-    export_discovered_profiles(output_path, github_users, location=normalized_location, incomplete=has_more)
     print(f"Found {len(github_users)} GitHub users total.")
     if has_more:
         print(
@@ -1717,6 +1689,33 @@ def _scrape_region(
     stopped_for_rate_limit = False
     rejection_counts: Counter[str] = Counter()
     request_failures = 0
+    candidate_keys = {candidate_key(user) for user in github_users}
+    pending_keys = {
+        candidate_key(user) for user in github_users
+        if candidate_key(user) not in completed_keys
+        and user["github_url"].casefold() not in assigned_links
+    }
+    last_reported_checks = 0
+
+    def report_coverage(stage: str, force: bool = False) -> None:
+        nonlocal last_reported_checks
+        checked = sum(rejection_counts.values())
+        if not force and checked - last_reported_checks < 100:
+            return
+        last_reported_checks = checked
+        resolved = len(candidate_keys) - len(pending_keys)
+        journal.write_status({
+            "region_id": region_id, "stage": stage,
+            "discovered_profiles": len(candidate_keys), "search_complete": not has_more,
+            "resolved_profiles": resolved, "pending_profiles": len(pending_keys),
+            "checked_this_run": checked, "outcomes_this_run": dict(rejection_counts),
+            "saved_contacts": len(contact_store.link_keys),
+            "validation_complete": stage == "complete",
+        })
+        print(f"Coverage: {resolved}/{len(candidate_keys)} profiles resolved; "
+              f"{len(pending_keys)} pending; {len(contact_store.link_keys)} saved contacts.")
+
+    report_coverage("validating", force=True)
 
     def persist_finished_outcomes(outcomes: list[ValidationOutcome]) -> None:
         """Persist gate results centrally before making them resumably complete."""
@@ -1730,6 +1729,9 @@ def _scrape_region(
         for outcome in outcomes:
             rejection_counts[outcome.reason] += 1
             request_failures += bool(outcome.error_message)
+            if not outcome.error_message:
+                pending_keys.discard(candidate_key(github_users[outcome.index]))
+        report_coverage("validating")
         new_contact_indexes = {
             outcome.index
             for outcome in outcomes
@@ -1856,6 +1858,7 @@ def _scrape_region(
                 for future in pending:
                     future.cancel()
                 update_region_state(region_id, current_index, False, total_processed)
+                report_coverage("interrupted", force=True)
                 if isinstance(fatal_error, GitHubRateLimitError):
                     print(fatal_error, file=sys.stderr)
                     print("Stopping early and saving progress.", file=sys.stderr)
@@ -1867,6 +1870,7 @@ def _scrape_region(
             future.cancel()
         print("\nInterrupted by user. Saving progress...")
         update_region_state(region_id, current_index, False, total_processed)
+        report_coverage("interrupted", force=True)
         raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
@@ -1879,9 +1883,10 @@ def _scrape_region(
 
     # is_end is True only when GitHub's exposed results are exhausted.
     is_complete = (processed_all_github_users and not has_more
-                   and not stopped_for_rate_limit and not request_failures)
+                   and not stopped_for_rate_limit and not request_failures and not pending_keys)
 
     update_region_state(region_id, current_index, is_complete, total_processed)
+    report_coverage("complete" if is_complete else "incomplete", force=True)
 
     if is_complete:
         print(f"Region {region_id} completed! All available GitHub users have been processed.")

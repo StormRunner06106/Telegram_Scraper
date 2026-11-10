@@ -2,11 +2,10 @@
 
 Discover public GitHub profiles by their declared location, then validate the
 existing account-age, achievement, and matching Telegram criteria and save
-qualified contacts to CSV. The full discovered profile list is saved separately
-under `new_output/profiles/`; its JSON sidecar records the count and whether
-GitHub search coverage was complete. A discovered profile is not necessarily a
-qualified contact. The interactive runner uses Ray to process several unique
-locations concurrently.
+qualified contacts to CSV. Every saved contact requires a Telegram username
+matching the GitHub username. Discovered candidates stay internal and are never
+exported as an unfiltered CSV. The interactive runner uses Ray to process several
+unique locations concurrently.
 
 ## Setup
 
@@ -91,9 +90,10 @@ The delay is applied independently by each gate after its Telegram check, so
 one region can have up to five validation requests in flight. With multiple
 selected regions, total validation concurrency is `region count × 5`.
 
-Progress is resumable. Each run discovers current matches and skips identities
-already validated for that output and filter policy. A previously complete
-region is searched again to find new profiles. Old numeric checkpoints are
+Progress is resumable. An interrupted run finishes its internal candidate queue
+and skips identities already validated for that output and filter policy.
+After that queue is complete, the next run searches again to find new profiles.
+Old numeric checkpoints are
 rescanned once because they cannot identify which profiles were checked; saved
 contacts are retained and deduplicated. `--no-resume` clears validation history
 to recheck rejected profiles, for example after their account age, achievements,
@@ -103,6 +103,13 @@ The worker summary reports newly qualified contacts and rejection counts for
 age, achievements, Telegram availability, and request errors. The contact rules
 remain 6–20 completed years of account age, more than 3 achievements, and an
 available Telegram username matching the GitHub username.
+Telegram confirmation requires a profile card displaying that exact username;
+generic contact landing pages and cards for other usernames are rejected.
+Every 100 checks, the worker reports resolved/total profiles, pending profiles,
+and saved contacts. The same counters are saved to
+`new_output/.scraper-state/<region>.status.json`. A completed search alone does
+not mark validation complete: the full queue must be resolved, with no pending
+request errors. Candidate queues and counters never become contact CSV rows.
 
 ## CSV browser
 
@@ -176,10 +183,8 @@ numbered location files. Both commands still accept an explicit `--output` path.
 - `new_output/*_1.csv`, `*_2.csv`, ...: location-specific region contacts,
   limited to 500 rows per file
 - `new_output/<location>.csv`: custom location searches
-- `new_output/profiles/*.csv`: all discovered GitHub profile IDs, usernames,
-  and links, before contact filtering; `.json` sidecars record search coverage
-- `new_output/.scraper-state/`: per-output validation journals; these contain
-  runtime data and must not be committed
+- `new_output/.scraper-state/`: internal candidate queues, validation journals,
+  and coverage status JSON; these contain runtime data and must not be committed
 - `data/output/`: historical exports; new runs do not update `contacts.csv`
 - `data/state/regions/*.json`: latest worker progress counters (not resume offsets)
 - `data/logs/github_scraper.txt`: main-process runtime log

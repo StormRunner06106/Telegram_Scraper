@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -23,12 +25,36 @@ class ValidationJournal:
             "CREATE TABLE IF NOT EXISTS decisions "
             "(identity TEXT PRIMARY KEY, contact_link TEXT NOT NULL, reason TEXT NOT NULL)"
         )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS discovery "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), users TEXT NOT NULL, incomplete INTEGER NOT NULL)"
+        )
         previous = self.connection.execute("SELECT value FROM policy").fetchone()
         if not resume or previous != (policy,):
             self.connection.execute("DELETE FROM decisions")
+            self.connection.execute("DELETE FROM discovery")
             self.connection.execute("DELETE FROM policy")
             self.connection.execute("INSERT INTO policy VALUES (?)", (policy,))
         self.connection.commit()
+
+    def save_candidates(self, users: list[dict[str, str]], incomplete: bool) -> None:
+        """Keep the validation queue internal; candidates are never CSV contacts."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO discovery VALUES (1, ?, ?)",
+                (json.dumps(users), int(incomplete)),
+            )
+
+    def load_candidates(self) -> tuple[list[dict[str, str]], bool] | None:
+        row = self.connection.execute("SELECT users, incomplete FROM discovery WHERE id = 1").fetchone()
+        return (json.loads(row[0]), bool(row[1])) if row else None
+
+    def write_status(self, status: dict) -> None:
+        path = self.path.with_suffix(".status.json")
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        payload = dict(status, updated_at=datetime.now(timezone.utc).isoformat(), pid=os.getpid())
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary.replace(path)
 
     def completed(self, saved_links: set[str]) -> set[str]:
         """A saved lead is only complete while its CSV row still exists."""
@@ -56,7 +82,7 @@ class ValidationJournal:
 
 def validation_policy(location_query: str, min_years: int, max_years: int, min_badges: int) -> str:
     return json.dumps({
-        "version": 1, "query": location_query,
+        "version": 2, "query": location_query,
         "age": [min_years, max_years], "badges_greater_than": min_badges,
         "telegram_required": True,
     }, sort_keys=True)

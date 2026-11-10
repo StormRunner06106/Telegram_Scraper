@@ -67,10 +67,15 @@ def test_request_failures_are_retried_after_resume(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "validate_user_in_gate", fail)
     core.scrape_region(12, output, delay_seconds=0)
     assert not core.get_region_state(12).is_end
+    status_path = tmp_path / ".scraper-state/12_dallas_tx.status.json"
+    status = json.loads(status_path.read_text())
+    assert status["pending_profiles"] == 1
+    assert status["validation_complete"] is False
     monkeypatch.setattr(core, "validate_user_in_gate", validate)
     assert core.scrape_region(12, output, delay_seconds=0) == 1
     assert calls == ["a", "a"]
     assert core.get_region_state(12).is_end
+    assert json.loads(status_path.read_text())["pending_profiles"] == 0
 
 
 def test_different_output_cannot_inherit_another_output_resume(monkeypatch, tmp_path):
@@ -82,14 +87,17 @@ def test_different_output_cannot_inherit_another_output_resume(monkeypatch, tmp_
     assert calls == ["a"]
 
 
-def test_capped_runs_continue_by_identity_when_order_changes(monkeypatch, tmp_path):
+def test_capped_runs_finish_saved_queue_before_rediscovering(monkeypatch, tmp_path):
     output, calls, _ = setup_run(monkeypatch, tmp_path)
     monkeypatch.setattr(core, "search_github_users", lambda *a, **kw: (users("a", "b", "c"), False))
     assert core.scrape_region(12, output, max_results=1, delay_seconds=0) == 1
     calls.clear()
-    monkeypatch.setattr(core, "search_github_users", lambda *a, **kw: (users("c", "a", "b"), False))
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("Pending validation queue should be reused")
+
+    monkeypatch.setattr(core, "search_github_users", unexpected_search)
     assert core.scrape_region(12, output, max_results=1, delay_seconds=0) == 1
-    assert calls == ["c"]
+    assert calls == ["b"]
 
 
 def test_no_resume_rechecks_rejected_profiles(monkeypatch, tmp_path):
@@ -119,27 +127,6 @@ def test_partial_output_deletion_recovers_only_missing_contacts(monkeypatch, tmp
     assert core.scrape_region(12, output, delay_seconds=0) == 1
     assert calls == ["b"]
     assert next(contact for contact in core.load_contacts(shard) if contact.telegramId == "@a").is_read
-
-
-def test_profile_export_has_all_candidates_and_preserves_browser_flags(monkeypatch, tmp_path):
-    output, _, validate = setup_run(monkeypatch, tmp_path)
-    monkeypatch.setattr(core, "search_github_users", lambda *a, **kw: (users("a", "b"), True))
-
-    def reject(index, gate, user, *args):
-        return replace(validate(index, gate, user, *args), contact=None, reason="account_age")
-
-    monkeypatch.setattr(core, "validate_user_in_gate", reject)
-    assert core.scrape_region(12, output, delay_seconds=0) == 0
-    profile_file = output.parent / "profiles" / output.name
-    fields, rows, _ = core.read_csv(profile_file)
-    assert {row["username"] for row in rows} == {"a", "b"}
-    assert not json.loads(profile_file.with_suffix(".json").read_text())["search_complete"]
-    rows[0]["is_read"] = "true"
-    core.write_csv(profile_file, fields + ["is_read"], rows)
-    core.export_discovered_profiles(output, users("a", "b", "c"), location="Dallas", incomplete=False)
-    _, updated, _ = core.read_csv(profile_file)
-    assert updated[0]["is_read"] == "true"
-    assert json.loads(profile_file.with_suffix(".json").read_text())["search_complete"]
 
 
 def test_resume_identity_survives_github_username_change(monkeypatch, tmp_path):
