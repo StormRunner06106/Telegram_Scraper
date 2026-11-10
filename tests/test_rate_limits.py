@@ -192,7 +192,7 @@ def test_text_logger_records_environment_readiness_without_secret_values(tmp_pat
     assert "do-not-log-this-token" not in contents
 
 
-def test_resumed_region_searches_through_saved_index_plus_next_batch(tmp_path: Path) -> None:
+def test_legacy_index_does_not_enlarge_or_skip_a_new_output_batch(tmp_path: Path) -> None:
     observed_targets: list[int] = []
 
     def fake_search(location: str, max_results: int, token=None):
@@ -216,7 +216,7 @@ def test_resumed_region_searches_through_saved_index_plus_next_batch(tmp_path: P
                             resume=True,
                         )
 
-    assert observed_targets == [350]
+    assert observed_targets == [100]
 
 
 def test_unlimited_resumed_region_requests_all_search_results(tmp_path: Path) -> None:
@@ -246,24 +246,25 @@ def test_unlimited_resumed_region_requests_all_search_results(tmp_path: Path) ->
     assert observed_targets == [None]
 
 
-def test_completed_region_is_not_reopened_for_unlimited_run(tmp_path: Path) -> None:
+def test_legacy_completed_region_is_rediscovered_when_output_is_missing(tmp_path: Path) -> None:
     state = core.RegionState(region_id=21, index=5000, is_end=True, total_processed=5000)
     region = {"id": 21, "name": "Canada", "location": "Canada", "country": "Canada"}
 
     with patch("githubscraper.core.get_region_by_id", return_value=region):
         with patch("githubscraper.core.get_region_state", return_value=state):
-            with patch("githubscraper.core.search_github_users") as mocked_search:
-                added = core.scrape_region(
-                    region_id=21,
-                    output_path=tmp_path / "contacts.csv",
-                    max_results=None,
-                    delay_seconds=0,
-                    token="token",
-                    resume=True,
-                )
+            with patch("githubscraper.core.search_github_users", return_value=([], False)) as mocked_search:
+                with patch("githubscraper.core.update_region_state"):
+                    added = core.scrape_region(
+                        region_id=21,
+                        output_path=tmp_path / "contacts.csv",
+                        max_results=None,
+                        delay_seconds=0,
+                        token="token",
+                        resume=True,
+                    )
 
     assert added == 0
-    mocked_search.assert_not_called()
+    mocked_search.assert_called_once_with("Canada", max_results=None, token="token")
 
 
 def test_unlimited_region_checks_every_returned_candidate_and_completes(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, deque
 import csv
 import json
 import logging
@@ -26,6 +27,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from githubscraper.csv_storage import csv_lock, read_csv, read_flag, write_csv
+from githubscraper.progress import ValidationJournal, candidate_key, validation_policy
 
 
 DEFAULT_COUNTRY = "United States"
@@ -601,20 +603,16 @@ def count_github_badges(username: str) -> int:
 
 
 def build_location_query(location: str) -> str:
-    """Build a flexible location query that matches variations."""
+    """Search the city (or country), without OR-ing it with the entire state.
+
+    Repeated GitHub location qualifiers are alternatives, not intersections.
+    A single city term includes profiles spelling the state as TX or Texas,
+    and profiles that only supply the city. Locations are self-reported text.
+    """
     parts = [part.strip() for part in location.split(",") if part.strip()]
-    
-    # Use separate location: terms for each part to match variations
-    # This finds "Austin, TX" and "Austin, Texas" and "Austin" etc.
-    query_parts = []
-    for part in parts:
-        if part.lower() == "united states":
-            continue
-        if " " in part:
-            query_parts.append(f'location:"{part}"')
-        else:
-            query_parts.append(f"location:{part}")
-    return " ".join(query_parts)
+    if not parts or any(char in parts[0] for char in '"\r\n'):
+        raise ValueError("Location must be nonempty text without quotes or newlines.")
+    return f'type:user location:"{parts[0]}"'
 
 
 @dataclass(frozen=True)
@@ -631,64 +629,60 @@ class DateRange:
         return (self.end - self.start).days + 1
 
 
-def search_github_users_single_query(location: str, additional_filters: str, token: str | None = None) -> tuple[list[dict[str, str]], bool]:
-    """Search GitHub users with a single query.
+@dataclass(frozen=True)
+class TimeRange:
+    start: datetime
+    end: datetime
 
-    GitHub exposes only the first 1000 matches for any search query, so the
-    boolean return value tells the caller whether this partition likely still
-    has hidden results beyond the API window.
+    @property
+    def query(self) -> str:
+        return f"created:{self.start:%Y-%m-%dT%H:%M:%S+00:00}..{self.end:%Y-%m-%dT%H:%M:%S+00:00}"
+
+
+def search_github_users_single_query(location: str, additional_filters: str, token: str | None = None) -> tuple[list[dict[str, str]], bool]:
+    """Read a partition; report caps, timeouts and short/duplicate pages honestly.
+
+    Crowded parents only need their first page: their children will cover the
+    full range. Stable sorting helps pagination, but resume never relies on it.
     """
-    users: list[dict[str, str]] = []
-    per_page = 100
     headers = github_headers(token)
     query = build_location_query(location)
     if additional_filters:
         query = f"{query} {additional_filters}"
-    
-    first_params = urlencode({"q": query, "per_page": per_page, "page": 1})
-    first_url = f"{GITHUB_SEARCH_URL}?{first_params}"
-    first_data, _ = request_json_response(first_url, headers=headers)
-    total_count = int(first_data.get("total_count") or 0)
-    page_count = min((total_count + per_page - 1) // per_page, GITHUB_SEARCH_RESULT_LIMIT // per_page)
-    hit_search_window = total_count > GITHUB_SEARCH_RESULT_LIMIT
-    LOGGER.info(
-        "Search query metadata location=%s filters=%s total_count=%s accessible_pages=%s capped=%s",
-        location,
-        additional_filters,
-        total_count,
-        page_count,
-        hit_search_window,
-    )
+    users: dict[str, dict[str, str]] = {}
 
-    for page in range(page_count, 0, -1):
-        LOGGER.info(
-            "Search page focus location=%s filters=%s page=%s/%s",
-            location,
-            additional_filters,
-            page,
-            page_count,
-        )
-        if page == 1:
-            data = first_data
-        else:
-            params = urlencode({"q": query, "per_page": per_page, "page": page})
+    def fetch_page(page: int) -> tuple[dict[str, Any], bool]:
+        params = urlencode({"q": query, "per_page": 100, "page": page,
+                            "sort": "joined", "order": "asc"})
+        for attempt in range(3):
             data, _ = request_json_response(f"{GITHUB_SEARCH_URL}?{params}", headers=headers)
+            for item in data.get("items", []):
+                if item.get("login") and item.get("html_url"):
+                    user = {"username": item["login"], "github_url": item["html_url"]}
+                    if item.get("id") is not None:
+                        user["id"] = str(item["id"])
+                    users[candidate_key(user)] = user
+            if not data.get("incomplete_results", False):
+                return data, False
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+        return data, True
 
-        items = data.get("items", [])
-        if not items:
-            continue
+    first_data, incomplete = fetch_page(1)
+    total_count = int(first_data.get("total_count") or 0)
+    capped = total_count > GITHUB_SEARCH_RESULT_LIMIT
+    LOGGER.info("Search partition query=%s total=%s capped=%s incomplete=%s",
+                query, total_count, capped, incomplete)
+    if capped or incomplete:
+        return list(users.values()), True
 
-        for item in items:
-            username = item.get("login")
-            github_url = item.get("html_url")
-            if username and github_url:
-                users.append({"username": username, "github_url": github_url})
-                if len(users) >= GITHUB_SEARCH_RESULT_LIMIT:
-                    break
-        if len(users) >= GITHUB_SEARCH_RESULT_LIMIT:
-            break
-
-    return users, hit_search_window
+    for page in range(2, (total_count + 99) // 100 + 1):
+        data, page_incomplete = fetch_page(page)
+        incomplete |= page_incomplete or int(data.get("total_count", total_count)) != total_count
+    # Changed search indexes, duplicate pages, or a missing page must trigger a
+    # narrower search instead of silently declaring this partition complete.
+    incomplete |= len(users) != total_count
+    return list(users.values()), incomplete
 
 
 def years_ago(current: datetime, years: int) -> date:
@@ -700,21 +694,16 @@ def years_ago(current: datetime, years: int) -> date:
 
 
 def created_date_ranges(now: datetime | None = None) -> list[DateRange]:
-    """Build yearly created-date partitions for accounts in the target age range."""
-    current = now or datetime.now(timezone.utc)
-    oldest_allowed = years_ago(current, MAX_GITHUB_YEARS + 1) + timedelta(days=1)
-    newest_allowed = years_ago(current, MIN_GITHUB_YEARS)
-    search_start = max(date(SEARCH_START_YEAR, 1, 1), oldest_allowed)
-    if search_start > newest_allowed:
-        return []
+    """Cover all creation dates, including pre-launch accounts and recent users.
 
-    ranges: list[DateRange] = []
-
-    for year in range(search_start.year, newest_allowed.year + 1):
-        start = max(date(year, 1, 1), search_start)
-        end = min(date(year, 12, 31), newest_allowed)
-        ranges.append(DateRange(start=start, end=end))
-
+    Contact age filtering belongs to validation, not candidate discovery.
+    The first range covers all early accounts without dozens of empty queries.
+    """
+    today = (now or datetime.now(timezone.utc)).date()
+    first_end = min(date(SEARCH_START_YEAR, 12, 31), today)
+    ranges = [DateRange(date(1970, 1, 1), first_end)]
+    for year in range(SEARCH_START_YEAR + 1, today.year + 1):
+        ranges.append(DateRange(date(year, 1, 1), min(date(year, 12, 31), today)))
     return ranges
 
 
@@ -730,102 +719,66 @@ def split_date_range(date_range: DateRange) -> tuple[DateRange, DateRange] | Non
     )
 
 
+def split_search_range(
+    partition: DateRange | TimeRange,
+) -> tuple[DateRange, DateRange] | tuple[TimeRange, TimeRange] | None:
+    """Split crowded days down to seconds, using GitHub's documented syntax."""
+    if isinstance(partition, DateRange):
+        dates = split_date_range(partition)
+        if dates:
+            return dates
+        start = datetime.combine(partition.start, datetime.min.time(), timezone.utc)
+        partition = TimeRange(start, start + timedelta(days=1, seconds=-1))
+    seconds = int((partition.end - partition.start).total_seconds())
+    if seconds == 0:
+        return None
+    midpoint = partition.start + timedelta(seconds=seconds // 2)
+    return (TimeRange(partition.start, midpoint),
+            TimeRange(midpoint + timedelta(seconds=1), partition.end))
+
+
 def search_github_users(
     location: str,
     max_results: int | None = None,
     token: str | None = None,
 ) -> tuple[list[dict[str, str]], bool]:
-    """Search public GitHub users by location with supported query partitions.
-    
-    Uses follower count and created-date ranges so each query stays within
-    GitHub Search's documented 1,000-result window.
-    
-    Returns:
-        tuple: (list of users, has_more) where has_more indicates if more results might exist
+    """Enumerate all public location matches through adaptive date partitions.
+
+    A True second result means coverage is incomplete; it is never disguised
+    as successful exhaustion. Rate limits and transport errors are retried by
+    the request layer. No contact qualification filters apply here.
     """
-    all_users: dict[str, dict[str, str]] = {}  # Use dict to deduplicate by username
+    if max_results is not None and max_results < 1:
+        raise ValueError("max_results must be at least 1.")
+    all_users: dict[str, dict[str, str]] = {}
+    pending = deque((partition, "") for partition in created_date_ranges())
     has_more = False
-    initial_date_ranges = created_date_ranges()
-    
-    print("Fetching users from GitHub (walking last pages first and splitting crowded date ranges)...")
-    LOGGER.info(
-        "Search started location=%s requested_users=%s",
-        location,
-        max_results if max_results is not None else "all",
-    )
-    
-    for follower_index, follower_filter in enumerate(FOLLOWER_RANGES):
-        pending_ranges = list(reversed(initial_date_ranges))
-        partition_count = 0
-
-        while pending_ranges:
-            date_range = pending_ranges.pop(0)
-            partition_count += 1
-
-            combined_filter = f"{follower_filter} {date_range.query}"
-            print(f"  Searching with filter: {combined_filter}")
-            LOGGER.info(
-                "Search focus location=%s follower_filter=%s date_range=%s partition=%s pending=%s",
-                location,
-                follower_filter,
-                date_range.query,
-                partition_count,
-                len(pending_ranges),
+    print(f"Discovering all public profiles matching {build_location_query(location)}...")
+    while pending:
+        partition, follower_filter = pending.popleft()
+        filters = f"{follower_filter} {partition.query}".strip()
+        users, incomplete = search_github_users_single_query(location, filters, token)
+        for user in users:
+            all_users[candidate_key(user)] = user
+        print(f"  {filters}: {len(users)} profiles; {len(all_users)} unique discovered")
+        if max_results is not None and len(all_users) >= max_results:
+            return list(all_users.values())[:max_results], (
+                has_more or incomplete or bool(pending) or len(all_users) > max_results
             )
-            try:
-                users, partition_has_more = search_github_users_single_query(location, combined_filter, token)
-                print(f"    Found {len(users)} users")
-                LOGGER.info(
-                    "Search partition fetched location=%s filters=%s users=%s capped=%s",
-                    location,
-                    combined_filter,
-                    len(users),
-                    partition_has_more,
-                )
-
-                # Add to dict (deduplicates automatically)
-                for user in users:
-                    username = user["username"]
-                    if username not in all_users:
-                        all_users[username] = user
-                
-                if max_results is not None and len(all_users) >= max_results:
-                    print(f"Collected requested search limit of {max_results} unique users.")
-                    more_partitions = bool(pending_ranges) or follower_index < len(FOLLOWER_RANGES) - 1
-                    more_in_current_partition = len(all_users) > max_results
-                    has_more = has_more or partition_has_more or more_partitions or more_in_current_partition
-                    users_list = list(all_users.values())[:max_results]
-                    return users_list, has_more
-
-                if partition_has_more:
-                    split_ranges = split_date_range(date_range)
-                    if split_ranges:
-                        print("    Partition is still capped by GitHub; splitting date range.")
-                        right, left = split_ranges[1], split_ranges[0]
-                        pending_ranges.insert(0, left)
-                        pending_ranges.insert(0, right)
-                        continue
-
-                    print("    Single-day partition is still capped by GitHub; some users may remain hidden.")
-                    has_more = True
-                
-                # Small delay between queries to be nice to GitHub
-                time.sleep(0.5)
-
-            except GitHubRateLimitError:
-                # request_json_response normally waits and retries internally.
-                # Preserve the error if a custom request layer raises it directly.
-                raise
-            except Exception as e:
-                print(f"    Error with filter {combined_filter}: {e}")
-                LOGGER.exception("Search partition failed location=%s filters=%s", location, combined_filter)
-                raise
-    
-    users_list = list(all_users.values())
-    print(f"Total unique users found: {len(users_list)}")
-    print("Processing order is stable across resumed batches.")
-    
-    return users_list, has_more
+        if incomplete:
+            children = split_search_range(partition)
+            if children:
+                # Smaller, disjoint ranges cover every second, including boundaries.
+                pending.extendleft((child, follower_filter) for child in reversed(children))
+            elif not follower_filter:
+                pending.extendleft((partition, followers) for followers in FOLLOWER_RANGES)
+            else:
+                has_more = True
+                LOGGER.warning("Unresolved search partition location=%s filters=%s", location, filters)
+                print(f"  INCOMPLETE: GitHub still limits or truncates {filters}", file=sys.stderr)
+        time.sleep(0.5)
+    print(f"Discovered {len(all_users)} unique public profiles; search complete={not has_more}.")
+    return list(all_users.values()), has_more
 
 
 def get_github_profile(username: str, token: str | None = None) -> dict[str, Any]:
@@ -1348,6 +1301,7 @@ class ValidationOutcome:
     contact: Contact | None
     message: str
     error_message: str = ""
+    reason: str = "rejected"
 
 
 def validate_user_in_gate(
@@ -1378,6 +1332,7 @@ def validate_user_in_gate(
             contact=None,
             message="Skipped after GitHub profile request failed.",
             error_message=f"Could not fetch GitHub profile for {username}: {error}",
+            reason="request_error",
         )
 
     created_at = str(profile.get("created_at") or "")
@@ -1389,6 +1344,8 @@ def validate_user_in_gate(
             github_url=github_url,
             contact=None,
             message=f"Skipped without GitHub created date: {username}",
+            error_message=f"GitHub returned no creation date for {username}; retry on next run.",
+            reason="request_error",
         )
 
     account_age_years = github_account_age_years(created_at)
@@ -1403,6 +1360,7 @@ def validate_user_in_gate(
                 f"Skipped account age outside {MIN_GITHUB_YEARS}-{MAX_GITHUB_YEARS} years: "
                 f"{username} ({account_age_years} years)"
             ),
+            reason="account_age",
         )
 
     try:
@@ -1417,6 +1375,7 @@ def validate_user_in_gate(
             contact=None,
             message="Skipped after GitHub achievement request failed.",
             error_message=f"Could not check GitHub badges for {username}: {error}",
+            reason="request_error",
         )
 
     if badge_count <= MIN_GITHUB_BADGES:
@@ -1430,6 +1389,7 @@ def validate_user_in_gate(
                 f"Skipped badge count <= {MIN_GITHUB_BADGES}: "
                 f"{username} ({badge_count} badges)"
             ),
+            reason="achievements",
         )
 
     telegram_error = ""
@@ -1455,6 +1415,7 @@ def validate_user_in_gate(
             contact=None,
             message=f"Skipped without Telegram match: {username}",
             error_message=telegram_error,
+            reason="request_error" if telegram_error else "no_telegram",
         )
 
     contact = build_contact(
@@ -1475,7 +1436,45 @@ def validate_user_in_gate(
             f"Qualified lead: {username} ({account_age_years} years, "
             f"{badge_count} badges{company_info}, name: {contact.nameMatch})"
         ),
+        reason="qualified",
     )
+
+
+def export_discovered_profiles(
+    output_path: Path,
+    users: list[dict[str, str]],
+    *,
+    location: str = "",
+    incomplete: bool = True,
+) -> Path:
+    """Keep the full discovery list separate from qualified contact shards."""
+    path = output_path.parent / "profiles" / output_path.name
+    with csv_lock(path):
+        fields = ["id", "username", "link"]
+        previous_rows: dict[str, dict[str, str]] = {}
+        has_bom = False
+        if path.exists():
+            previous_fields, rows, has_bom = read_csv(path)
+            fields.extend(field for field in previous_fields if field not in fields)
+            previous_rows = {row.get("link", "").casefold(): row for row in rows}
+        write_csv(path, fields, [
+            {**previous_rows.get(user["github_url"].casefold(), {}),
+             "id": user.get("id", ""), "username": user["username"], "link": user["github_url"]}
+            for user in users
+        ], has_bom)
+        metadata = {
+            "query": build_location_query(location) if location else "",
+            "discovered_profiles": len(users),
+            "search_complete": not incomplete,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "contact_filters_applied": False,
+        }
+        metadata_path = path.with_suffix(".json")
+        temporary = metadata_path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        temporary.replace(metadata_path)
+    print(f"Discovered profile list: {path} ({len(users)} profiles)")
+    return path
 
 
 def scrape(
@@ -1500,12 +1499,15 @@ def scrape(
     seen_links = {contact.link.lower() for contact in contacts}
 
     try:
-        github_users, _ = search_github_users(normalized_location, max_results=max_results, token=token)
+        github_users, has_more = search_github_users(normalized_location, max_results=max_results, token=token)
     except GitHubRateLimitError as error:
         print(error, file=sys.stderr)
         return 0
 
+    export_discovered_profiles(output_path, github_users, location=normalized_location, incomplete=has_more)
     print(f"Found {len(github_users)} GitHub users. Checking account age, badges, and Telegram usernames...")
+    if has_more:
+        print("Profile discovery is incomplete; see the profile export's JSON metadata.", file=sys.stderr)
 
     added = 0
     processed = 0
@@ -1525,6 +1527,8 @@ def scrape(
         if github_url.lower() in seen_links:
             print(f"Skipping duplicate: {username}")
             continue
+
+        processed += 1
 
         try:
             profile = get_github_profile(username, token=token)
@@ -1583,8 +1587,6 @@ def scrape(
             print(f"Skipped without Telegram match: {username}")
             LOGGER.info("Profile rejected username=%s reason=no_telegram_match", username)
         
-        processed += 1
-
         if delay_seconds > 0:
             time.sleep(delay_seconds)
 
@@ -1601,6 +1603,40 @@ def scrape_region(
     token: str | None = None,
     resume: bool = True,
     validation_gates: int = DEFAULT_VALIDATION_GATES,
+) -> int:
+    """Resume by profile identity, scoped to the output and qualification policy."""
+    if validation_gates < 1:
+        raise ValueError("validation_gates must be at least 1.")
+    if max_results is not None and max_results < 1:
+        raise ValueError("max_results must be at least 1.")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds cannot be negative.")
+    region = get_region_by_id(region_id)
+    if region is None:
+        raise ValueError(f"Unknown region ID: {region_id}")
+    output_path = output_path or region_output_path(region)
+    policy = validation_policy(build_location_query(get_region_location(region)),
+                               MIN_GITHUB_YEARS, MAX_GITHUB_YEARS, MIN_GITHUB_BADGES)
+    # Serialize runs for this output as well as its journal. Other regions and
+    # the CSV browser can continue independently.
+    with csv_lock(output_path.parent / ".scraper-state" / f"{output_path.stem}.run"):
+        journal = ValidationJournal(output_path, policy, resume)
+        try:
+            return _scrape_region(region_id, output_path, max_results, delay_seconds,
+                                  token, resume, validation_gates, journal=journal)
+        finally:
+            journal.close()
+
+
+def _scrape_region(
+    region_id: int,
+    output_path: Path | None = None,
+    max_results: int | None = None,
+    delay_seconds: float = 1.0,
+    token: str | None = None,
+    resume: bool = True,
+    validation_gates: int = DEFAULT_VALIDATION_GATES,
+    *, journal: ValidationJournal,
 ) -> int:
     """Scrape a region by ID with resume capability."""
     if validation_gates < 1:
@@ -1625,26 +1661,19 @@ def scrape_region(
         bool(token),
     )
     
-    # Load state
     state_obj = get_region_state(region_id)
-    
-    if state_obj.is_end and resume:
-        print(f"Region {region_id} already completed. Use --no-resume to restart.")
-        return 0
-    
-    start_index = state_obj.index if resume else 0
-    total_processed = state_obj.total_processed if resume else 0
-    
-    if start_index > 0:
-        print(f"Resuming from index {start_index} (already processed {total_processed} users)")
-    
     normalized_location = normalize_location(location)
     contact_store = RegionContactCsvStore(output_path)
     assigned_links = contact_store.link_keys
-
-    # A capped resumed batch must rebuild a stable prefix through the saved
-    # index. Unlimited runs enumerate every supported search partition.
-    search_target = None if max_results is None else start_index + max_results
+    completed_keys = journal.completed(assigned_links)
+    start_index = 0
+    total_processed = 0
+    if state_obj.index and not completed_keys:
+        print("Legacy numeric checkpoint cannot safely identify processed profiles; "
+              "rescanning candidates and retaining existing contacts.")
+    print(f"Resume journal: {len(completed_keys)} validated profiles; "
+          f"{len(assigned_links)} saved contacts.")
+    search_target = None if max_results is None else len(completed_keys) + len(assigned_links) + max_results
     LOGGER.info(
         "Region search target region_id=%s saved_index=%s batch_limit=%s search_target=%s",
         region_id,
@@ -1662,6 +1691,7 @@ def scrape_region(
         print(error, file=sys.stderr)
         return 0
 
+    export_discovered_profiles(output_path, github_users, location=normalized_location, incomplete=has_more)
     print(f"Found {len(github_users)} GitHub users total.")
     if has_more:
         print(
@@ -1685,15 +1715,21 @@ def scrape_region(
     free_gate_ids = list(range(1, validation_gates + 1))
     pending: dict[Future[ValidationOutcome], tuple[int, int]] = {}
     stopped_for_rate_limit = False
+    rejection_counts: Counter[str] = Counter()
+    request_failures = 0
 
     def persist_finished_outcomes(outcomes: list[ValidationOutcome]) -> None:
         """Persist gate results centrally before making them resumably complete."""
-        nonlocal added
+        nonlocal added, request_failures
         contacts_to_save = [
             outcome.contact for outcome in outcomes if outcome.contact is not None
         ]
         persisted_keys = contact_store.append_unique(contacts_to_save)
         added += len(persisted_keys)
+        journal.record(outcomes, github_users)
+        for outcome in outcomes:
+            rejection_counts[outcome.reason] += 1
+            request_failures += bool(outcome.error_message)
         new_contact_indexes = {
             outcome.index
             for outcome in outcomes
@@ -1754,14 +1790,15 @@ def scrape_region(
                 github_url = user["github_url"]
                 link_key = github_url.casefold()
 
-                if link_key in assigned_links:
+                if link_key in assigned_links or candidate_key(user) in completed_keys:
                     completed_outcomes[candidate_index] = ValidationOutcome(
                         index=candidate_index,
                         gate_id=None,
                         username=username,
                         github_url=github_url,
                         contact=None,
-                        message=f"Skipping duplicate: {username}",
+                        message=f"Already saved or validated: {username}",
+                        reason="previously_processed",
                     )
                     continue
 
@@ -1841,7 +1878,8 @@ def scrape_region(
     processed_all_github_users = current_index >= len(github_users)
 
     # is_end is True only when GitHub's exposed results are exhausted.
-    is_complete = processed_all_github_users and not has_more and not stopped_for_rate_limit
+    is_complete = (processed_all_github_users and not has_more
+                   and not stopped_for_rate_limit and not request_failures)
 
     update_region_state(region_id, current_index, is_complete, total_processed)
 
@@ -1859,6 +1897,11 @@ def scrape_region(
             "Region CSV shards: "
             + ", ".join(str(path) for path in contact_store.shard_paths)
         )
+    print(f"Validation outcomes this run: {dict(rejection_counts)}")
+    if request_failures:
+        print(f"{request_failures} request failures remain retryable on the next run.")
+    LOGGER.info("Validation summary region_id=%s outcomes=%s saved_contacts=%s",
+                region_id, dict(rejection_counts), len(contact_store.link_keys))
     print(f"Total processed: {total_processed} users")
     LOGGER.info(
         "Region scrape batch finished region_id=%s current_index=%s total_processed=%s "

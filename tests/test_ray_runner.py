@@ -124,10 +124,12 @@ def test_cli_still_allows_an_explicit_test_cap() -> None:
     assert args.max_results == 25
 
 
-def test_each_ray_region_worker_uses_five_validation_gates(tmp_path: Path) -> None:
+def test_each_ray_region_worker_uses_five_validation_gates(tmp_path: Path, monkeypatch) -> None:
     output = tmp_path / "region.csv"
     region = {"id": 21, "name": "Canada", "location": "Canada"}
     state = core.RegionState(region_id=21, index=10, is_end=False, total_processed=10)
+    log_paths = []
+    monkeypatch.setattr("githubscraper.ray_runner.setup_logging", log_paths.append)
 
     with patch("githubscraper.ray_runner.get_region_by_id", return_value=region):
         with patch("githubscraper.ray_runner.load_contact_family", return_value=[]):
@@ -136,6 +138,7 @@ def test_each_ray_region_worker_uses_five_validation_gates(tmp_path: Path) -> No
                     result = _run_region_worker(21, str(output), None, 1.0, "token")
 
     assert not result["error"]
+    assert log_paths == [core.LOG_DIR / "regions" / "region_21.txt"]
     scrape.assert_called_once_with(
         region_id=21,
         output_path=output,

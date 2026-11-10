@@ -8,12 +8,14 @@ from typing import Any, Iterable
 
 from githubscraper.core import (
     DEFAULT_VALIDATION_GATES,
+    LOG_DIR,
     get_region_by_id,
     get_region_state,
     load_contact_family,
     load_contacts,
     region_output_path,
     scrape_region,
+    setup_logging,
     write_contacts,
 )
 
@@ -58,6 +60,7 @@ def _run_region_worker(
     validation_gates: int = DEFAULT_VALIDATION_GATES,
 ) -> dict[str, Any]:
     """Execute one region inside a Ray worker process."""
+    setup_logging(LOG_DIR / "regions" / f"region_{region_id}.txt")
     region = get_region_by_id(region_id)
     region_name = str(region.get("name")) if region else f"Region {region_id}"
     starting_links = {

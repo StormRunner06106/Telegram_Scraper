@@ -1,8 +1,12 @@
 # GitHub Location Scraper
 
-Collect public GitHub profiles by location, validate the existing account-age,
-achievement, and matching Telegram criteria, and save contacts to CSV. The
-interactive runner uses Ray to process several unique locations concurrently.
+Discover public GitHub profiles by their declared location, then validate the
+existing account-age, achievement, and matching Telegram criteria and save
+qualified contacts to CSV. The full discovered profile list is saved separately
+under `new_output/profiles/`; its JSON sidecar records the count and whether
+GitHub search coverage was complete. A discovered profile is not necessarily a
+qualified contact. The interactive runner uses Ray to process several unique
+locations concurrently.
 
 ## Setup
 
@@ -49,9 +53,12 @@ On startup the runner:
 7. Reports the saved contact count. Runs do not merge into `contacts.csv`.
 
 Gate threads never write CSV files directly. Their region coordinator assigns
-each GitHub link once, serializes and atomically replaces the region CSV, and
-only checkpoints a contiguous completed prefix. This prevents duplicate rows
-and prevents a fast gate from advancing resume state past an unfinished user.
+each GitHub link once and serializes and atomically replaces the region CSV.
+An identity journal under `new_output/.scraper-state/` records each successful
+validation after its contact is durable. Resume uses GitHub account IDs (or
+profile links for legacy candidates), so changed search ordering cannot skip
+profiles. Request failures remain retryable. Deleted contact rows are checked
+again on the next run. Independent runs targeting the same output are locked.
 
 Each region is stored in numbered CSV shards containing at most 500 contacts:
 
@@ -84,8 +91,18 @@ The delay is applied independently by each gate after its Telegram check, so
 one region can have up to five validation requests in flight. With multiple
 selected regions, total validation concurrency is `region count × 5`.
 
-Progress is resumable, so another run continues each selected region from its
-saved index.
+Progress is resumable. Each run discovers current matches and skips identities
+already validated for that output and filter policy. A previously complete
+region is searched again to find new profiles. Old numeric checkpoints are
+rescanned once because they cannot identify which profiles were checked; saved
+contacts are retained and deduplicated. `--no-resume` clears validation history
+to recheck rejected profiles, for example after their account age, achievements,
+or Telegram availability changes. It preserves existing contacts.
+
+The worker summary reports newly qualified contacts and rejection counts for
+age, achievements, Telegram availability, and request errors. The contact rules
+remain 6–20 completed years of account age, more than 3 achievements, and an
+available Telegram username matching the GitHub username.
 
 ## CSV browser
 
@@ -159,19 +176,37 @@ numbered location files. Both commands still accept an explicit `--output` path.
 - `new_output/*_1.csv`, `*_2.csv`, ...: location-specific region contacts,
   limited to 500 rows per file
 - `new_output/<location>.csv`: custom location searches
+- `new_output/profiles/*.csv`: all discovered GitHub profile IDs, usernames,
+  and links, before contact filtering; `.json` sidecars record search coverage
+- `new_output/.scraper-state/`: per-output validation journals; these contain
+  runtime data and must not be committed
 - `data/output/`: historical exports; new runs do not update `contacts.csv`
-- `data/state/regions/*.json`: independent worker resume state
-- `data/logs/github_scraper.txt`: runtime log
+- `data/state/regions/*.json`: latest worker progress counters (not resume offsets)
+- `data/logs/github_scraper.txt`: main-process runtime log
+- `data/logs/regions/region_<id>.txt`: individual Ray worker logs
 
 ## API behavior
 
 The scraper only queries public endpoints and honors GitHub rate-limit responses,
 including primary and secondary limits. Interrupted responses are retried with
-backoff. GitHub Search exposes at most 1,000 results for a single query; the
-scraper enumerates supported follower and account-date partitions to collect
-additional public results where available. "Unlimited" means there is no local
-candidate-count cutoff; it cannot expose private profiles or results that GitHub
-does not return through its API.
+backoff. Discovery covers all account creation dates, including recent accounts
+and pre-2008 accounts. GitHub Search exposes at most 1,000 results per query;
+crowded date ranges are divided down to seconds, with follower partitions as a
+fallback. Timed-out search pages are retried, and missing/duplicate pages trigger
+subdivision instead of silently reporting completion. Unresolved partitions are
+reported as incomplete and prevent a region from being marked complete.
+
+City searches use one location qualifier: Dallas, TX becomes
+`type:user location:"Dallas"`. Multiple `location:` qualifiers combine as
+alternatives on GitHub: adding `location:Texas` also finds profiles elsewhere
+in Texas. The single city term includes users writing Dallas alone, Dallas TX,
+or Dallas Texas. Country-wide searches keep the country term. Locations are
+self-reported text; the API does not establish physical residence, distinguish
+every same-named city, infer missing locations, or expose private profiles.
+"Complete" means the supported public search partitions were exhausted, not
+that every person living in a place has been found. See GitHub's documentation
+on [user search](https://docs.github.com/en/search-github/searching-on-github/searching-users)
+and [search limits and incomplete results](https://docs.github.com/en/rest/search/search).
 
 ## Tests
 

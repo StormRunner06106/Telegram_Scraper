@@ -9,6 +9,7 @@ venv/
 .env
 data/output/
 new_output/
+.scraper-state/
 data/backups/
 data/state/
 data/logs/

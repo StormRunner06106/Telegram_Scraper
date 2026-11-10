@@ -187,7 +187,7 @@ def test_max_results_is_global_across_all_gates(tmp_path: Path) -> None:
     update_state.assert_called_with(21, 7, False, 7)
 
 
-def test_resumed_run_assigns_only_users_after_saved_frontier(tmp_path: Path) -> None:
+def test_legacy_numeric_cursor_cannot_skip_profiles_without_identity_history(tmp_path: Path) -> None:
     users = _users(10)
     resumed_state = core.RegionState(region_id=21, index=4, is_end=False, total_processed=4)
     assignments: list[int] = []
@@ -221,9 +221,9 @@ def test_resumed_run_assigns_only_users_after_saved_frontier(tmp_path: Path) -> 
                             resume=True,
                         )
 
-    assert search_targets == [7]
-    assert sorted(assignments) == [4, 5, 6]
-    update_state.assert_called_with(21, 7, False, 7)
+    assert search_targets == [3]
+    assert sorted(assignments) == [0, 1, 2]
+    update_state.assert_called_with(21, 3, False, 3)
 
 
 def test_resume_checkpoint_never_crosses_an_unfinished_gate(tmp_path: Path) -> None:
